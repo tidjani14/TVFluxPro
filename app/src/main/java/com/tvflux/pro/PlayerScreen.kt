@@ -404,7 +404,6 @@ fun PlayerScreen(
                 }
             )
             setEnableDecoderFallback(true)
-            setAllowedJoiningTimeMs(if (isWeakDevice) 2_500L else 4_500L)
         }
 
         val trackSelector = DefaultTrackSelector(context).apply {
