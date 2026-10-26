@@ -195,7 +195,7 @@ object TiviMateDiagnostics {
     var lastSyncSummary: String = "المكتبة المحلية جاهزة"
         private set
 
-    private val sensitiveParamRegex = Regex("(?i)(password|pass|token|auth|cookie|key|secret)=([^&\s]+)")
+    private val sensitiveParamRegex = Regex("(?i)(password|pass|token|auth|cookie|key|secret)=([^&\\s]+)")
 
     fun sanitizeLogMessage(raw: String): String {
         return sensitiveParamRegex.replace(raw) { matchResult ->
