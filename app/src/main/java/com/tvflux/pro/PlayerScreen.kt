@@ -1,0 +1,2784 @@
+@file:Suppress("DEPRECATION")
+
+package com.tvflux.pro
+
+import android.app.Activity
+import android.app.ActivityManager
+import android.app.PictureInPictureParams
+import android.content.Context
+import android.net.Uri
+import android.os.Build
+import android.util.Base64
+import android.util.Rational
+import android.view.KeyEvent
+import android.view.WindowManager
+import androidx.activity.compose.BackHandler
+import androidx.annotation.OptIn
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.background
+import androidx.compose.foundation.basicMarquee
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.PlaybackParameters
+import androidx.media3.common.Player
+import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.common.Tracks
+import androidx.media3.common.VideoSize
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.SeekParameters
+import androidx.media3.exoplayer.dash.DashMediaSource
+import androidx.media3.exoplayer.dash.manifest.DashManifest
+import androidx.media3.exoplayer.dash.manifest.DashManifestParser
+import androidx.media3.exoplayer.drm.DefaultDrmSessionManager
+import androidx.media3.exoplayer.drm.FrameworkMediaDrm
+import androidx.media3.exoplayer.drm.LocalMediaDrmCallback
+import androidx.media3.exoplayer.hls.HlsMediaSource
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
+import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
+import androidx.media3.extractor.DefaultExtractorsFactory
+import androidx.media3.extractor.mp4.Mp4Extractor
+import androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory
+import androidx.media3.extractor.ts.TsExtractor
+import androidx.media3.ui.PlayerView
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import java.io.ByteArrayInputStream
+import java.io.InputStream
+
+data class TrackOption(
+    val title: String,
+    val subtitle: String,
+    val groupIndex: Int,
+    val trackIndex: Int,
+    val isSelected: Boolean
+)
+
+/**
+ * Authentic IBO Player + VLC Hybrid User-Agent Rotation (v18.0):
+ * Starts with official IBOPlayer/1.0 profile so IPTV servers that require IBO Player accept the stream
+ * immediately on attempt #1, and rotates through IBOPlayerPro, OkHttp, and VLC on fallback retries.
+ */
+private val STREAM_USER_AGENTS = IboPlayerProfileSpoofer.STREAM_PLAYBACK_USER_AGENTS
+
+/**
+ * Custom Ultra-Fast MPD (DASH) Manifest Parser:
+ * Ensures dynamic live .mpd manifests refresh every ~2.4 seconds even when servers roll segments
+ * every 3 seconds or set an overly long/missing minimumUpdatePeriod attribute!
+ */
+@OptIn(UnstableApi::class)
+private class FastRefreshDashManifestParser : DashManifestParser() {
+    override fun parse(uri: Uri, inputStream: InputStream): DashManifest {
+        val rawBytes = inputStream.readBytes()
+        val xmlText = String(rawBytes, Charsets.UTF_8)
+        val patchedXml = if (xmlText.contains("type=\"dynamic\"", ignoreCase = true)) {
+            if (xmlText.contains("minimumUpdatePeriod=", ignoreCase = true)) {
+                xmlText.replace(
+                    Regex("minimumUpdatePeriod\\s*=\\s*\"[^\"]*\"", RegexOption.IGNORE_CASE),
+                    "minimumUpdatePeriod=\"PT2.4S\""
+                )
+            } else {
+                xmlText.replaceFirst(
+                    Regex("<MPD\\b", RegexOption.IGNORE_CASE),
+                    "<MPD minimumUpdatePeriod=\"PT2.4S\""
+                )
+            }
+        } else {
+            xmlText
+        }
+        return super.parse(uri, ByteArrayInputStream(patchedXml.toByteArray(Charsets.UTF_8)))
+    }
+}
+
+@OptIn(UnstableApi::class)
+private fun buildClearKeyDrmManager(drmKeyString: String): DefaultDrmSessionManager? {
+    val clean = drmKeyString.trim()
+    if (clean.isEmpty()) return null
+    return runCatching {
+        val jwkJson = if (clean.startsWith("{")) {
+            clean
+        } else if (clean.contains(":")) {
+            val kidHex = clean.substringBefore(":").trim()
+            val keyHex = clean.substringAfter(":").trim()
+            val kidB64 = hexToBase64Url(kidHex)
+            val keyB64 = hexToBase64Url(keyHex)
+            "{\"keys\":[{\"kty\":\"oct\",\"k\":\"$keyB64\",\"kid\":\"$kidB64\"}],\"type\":\"temporary\"}"
+        } else {
+            return null
+        }
+        val callback = LocalMediaDrmCallback(jwkJson.toByteArray(Charsets.UTF_8))
+        DefaultDrmSessionManager.Builder()
+            .setUuidAndExoMediaDrmProvider(C.CLEARKEY_UUID, FrameworkMediaDrm.DEFAULT_PROVIDER)
+            .setMultiSession(false)
+            .build(callback)
+    }.getOrNull()
+}
+
+private fun hexToBase64Url(hex: String): String {
+    val clean = hex.replace("-", "").trim()
+    val len = clean.length
+    val data = ByteArray(len / 2)
+    var i = 0
+    while (i < len - 1) {
+        data[i / 2] = ((Character.digit(clean[i], 16) shl 4) + Character.digit(clean[i + 1], 16)).toByte()
+        i += 2
+    }
+    return Base64.encodeToString(data, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
+}
+
+@OptIn(UnstableApi::class)
+@Composable
+fun PlayerScreen(
+    channel: TvChannel,
+    siblingChannels: List<TvChannel>,
+    allChannels: List<TvChannel>,
+    precomputedBouquets: List<Pair<String, List<TvChannel>>> = emptyList(),
+    favorites: List<TvChannel>,
+    xtreamPlaylists: List<XtreamAccountConfig> = emptyList(),
+    preferences: PlayerPreferences,
+    isFavorite: Boolean,
+    initialResumePositionMs: Long = 0L,
+    onSaveVodProgress: (TvChannel, Long, Long) -> Unit = { _, _, _ -> },
+    onToggleFavorite: (TvChannel) -> Unit,
+    onUpdatePreferences: (PlayerPreferences) -> Unit,
+    onSelectChannel: (TvChannel) -> Unit,
+    onBack: () -> Unit
+) {
+    val context = LocalContext.current
+    val activity = context as? Activity
+    val lang = preferences.appLanguage
+
+    var showControls by remember { mutableStateOf(false) }
+    var showQuickDrawer by remember { mutableStateOf(false) }
+    var drawerSelectedBouquet by remember { mutableStateOf(channel.group) }
+    var focusFirstChannelTrigger by remember { mutableStateOf(0) }
+
+    var showTracksDialog by remember { mutableStateOf(false) }
+    var resizeMode by remember { mutableStateOf(preferences.resizeMode) }
+    var playbackSpeed by remember { mutableStateOf(PlaybackSpeedOption.NORMAL) }
+
+    var isBuffering by remember { mutableStateOf(true) }
+    var showBufferingBadge by remember { mutableStateOf(false) }
+    var isPlaying by remember { mutableStateOf(true) }
+    var errorMessage by remember(channel.stableKey) { mutableStateOf<String?>(null) }
+    var lastErrorCodeName by remember(channel.stableKey) { mutableStateOf("") }
+    var fastFallbackTriggered by remember(channel.stableKey) { mutableStateOf(false) }
+    val initialNeedsVlc = remember(channel.stableKey, channel.url) {
+        val low = channel.url.lowercase().substringBefore("?")
+        low.endsWith(".avi") || low.endsWith(".flv") || low.endsWith(".wmv") ||
+            low.endsWith(".mpg") || low.endsWith(".mpeg") || low.endsWith(".vob") ||
+            low.endsWith(".divx") || low.endsWith(".rmvb")
+    }
+    var codecRequiresVlc by remember(channel.stableKey) { mutableStateOf(initialNeedsVlc) }
+    var forceVlcSoftwareVideo by remember(channel.stableKey) { mutableStateOf(initialNeedsVlc) }
+    val forceExoSoftwareCodec = remember {
+        java.util.concurrent.atomic.AtomicBoolean(preferences.preferSoftwareDecoder)
+    }
+    LaunchedEffect(preferences.preferSoftwareDecoder) {
+        forceExoSoftwareCodec.set(preferences.preferSoftwareDecoder)
+    }
+    var retryCount by remember(channel.stableKey) { mutableStateOf(0) }
+    var videoResolutionLabel by remember(channel.stableKey) { mutableStateOf("") }
+    var currentTracksSnapshot by remember { mutableStateOf(Tracks.EMPTY) }
+
+    val matchingAccount = remember(channel.playlistId, xtreamPlaylists) {
+        xtreamPlaylists.find { it.id == channel.playlistId }
+    }
+    var resolvedVodUrl by remember(channel.stableKey) { mutableStateOf<String?>(null) }
+    val formatCandidateUrls = remember(channel.stableKey, channel.url, matchingAccount, resolvedVodUrl) {
+        val baseCands = channel.buildFormatCandidateUrls(matchingAccount)
+        val real = resolvedVodUrl?.trim().orEmpty()
+        if (real.isNotBlank()) {
+            (listOf(real) + baseCands).distinct()
+        } else {
+            baseCands
+        }
+    }
+    var detectedSpecLabel by remember(channel.stableKey) {
+        mutableStateOf(
+            listOfNotNull(
+                channel.videoCodecHint.takeIf { it.isNotBlank() },
+                channel.audioCodecHint.takeIf { it.isNotBlank() }
+            ).joinToString(" • ")
+        )
+    }
+    var candidateIndex by remember(channel.stableKey) { mutableStateOf(0) }
+    var formatAttemptMode by remember(channel.stableKey) { mutableStateOf(0) }
+    var numberInputBuffer by remember { mutableStateOf("") }
+
+    val rootPlayerFocusRequester = remember { FocusRequester() }
+    val centerPlayFocusRequester = remember { FocusRequester() }
+    val activeBouquetFocusRequester = remember { FocusRequester() }
+    val firstChannelInBouquetFocusRequester = remember { FocusRequester() }
+    val activeChannelFocusRequester = remember { FocusRequester() }
+
+    var networkSpeedLabel by remember { mutableStateOf(NetworkSpeedMonitor.sampleCurrentSpeedLabel()) }
+    var vodPositionMs by remember(channel.stableKey) { mutableStateOf(initialResumePositionMs.coerceAtLeast(0L)) }
+    var vodDurationMs by remember(channel.stableKey) { mutableStateOf(0L) }
+    var initialResumeApplied by remember(channel.stableKey) { mutableStateOf(false) }
+
+    LaunchedEffect(showQuickDrawer, showTracksDialog, showControls) {
+        if (!showQuickDrawer && !showTracksDialog && !showControls) {
+            for (attempt in 1..3) {
+                delay(55L)
+                if (runCatching { rootPlayerFocusRequester.requestFocus() }.isSuccess) break
+            }
+        } else if (showControls && !showQuickDrawer && !showTracksDialog) {
+            for (attempt in 1..4) {
+                delay(65L)
+                if (runCatching { centerPlayFocusRequester.requestFocus() }.isSuccess) break
+            }
+        }
+    }
+
+    LaunchedEffect(isBuffering, errorMessage) {
+        if (isBuffering && errorMessage == null) {
+            delay(850L)
+            if (isBuffering) showBufferingBadge = true
+        } else {
+            showBufferingBadge = false
+        }
+    }
+
+    val favLabel = AppStrings.favoritesLabel(lang)
+    val allLabel = AppStrings.allBouquetsLabel(lang)
+
+    // Instant O(1) reuse of precomputed bouquets from CatalogViewSnapshot (zero re-grouping lag on Player open!)
+    val allBouquets = remember(precomputedBouquets, favorites, favLabel, channel.group, siblingChannels) {
+        if (precomputedBouquets.isNotEmpty()) {
+            precomputedBouquets.map { pair ->
+                if (pair.first == favLabel) favLabel to favorites else pair
+            }
+        } else {
+            listOf(channel.group to siblingChannels)
+        }
+    }
+
+    val drawerChannels = remember(allBouquets, drawerSelectedBouquet, siblingChannels) {
+        allBouquets.find { it.first == drawerSelectedBouquet }?.second
+            ?: siblingChannels.ifEmpty {
+                allBouquets.firstOrNull { !it.first.startsWith("★") && it.second.isNotEmpty() }?.second.orEmpty()
+            }
+    }
+
+    val effectiveUrl = remember(formatCandidateUrls, candidateIndex) {
+        formatCandidateUrls.getOrElse(candidateIndex.coerceIn(0, (formatCandidateUrls.size - 1).coerceAtLeast(0))) {
+            channel.url
+        }
+    }
+
+    DisposableEffect(Unit) {
+        val window = activity?.window
+        window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        val insetsController = window?.let { WindowCompat.getInsetsController(it, it.decorView) }
+        insetsController?.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        insetsController?.hide(WindowInsetsCompat.Type.systemBars())
+
+        onDispose {
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            insetsController?.show(WindowInsetsCompat.Type.systemBars())
+        }
+    }
+
+    val httpFactory = remember {
+        OkHttpDataSource.Factory(ChannelRepository.streamHttpClient)
+            .setUserAgent(STREAM_USER_AGENTS.first())
+    }
+
+    // Ultra-Fast Extractor Suite (v22.0):
+    // - MODE_SINGLE_PMT + 188*600 timestamp search bytes locks onto MPEG-TS audio/video codecs 5x faster (<100ms)!
+    // - FLAG_DETECT_ACCESS_UNITS fixes H.264/HEVC live channels that omit AUD NAL units (prevents frame drops & black screen).
+    // - FLAG_WORKAROUND_IGNORE_EDIT_LISTS fixes MP4 VOD movies with broken edit lists.
+    val extractorsFactory = remember {
+        DefaultExtractorsFactory()
+            .setConstantBitrateSeekingEnabled(true)
+            .setConstantBitrateSeekingAlwaysEnabled(true)
+            .setMp4ExtractorFlags(Mp4Extractor.FLAG_WORKAROUND_IGNORE_EDIT_LISTS)
+            .setTsExtractorMode(TsExtractor.MODE_SINGLE_PMT)
+            .setTsExtractorFlags(
+                DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES or
+                    DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS or
+                    DefaultTsPayloadReaderFactory.FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS or
+                    DefaultTsPayloadReaderFactory.FLAG_IGNORE_SPLICE_INFO_STREAM
+            )
+            .setTsExtractorTimestampSearchBytes(188 * 600)
+    }
+
+    val defaultMediaSourceFactory = remember {
+        DefaultMediaSourceFactory(context, extractorsFactory)
+            .setDataSourceFactory(httpFactory)
+            .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(2))
+    }
+
+    val fastDashMediaSourceFactory = remember {
+        DashMediaSource.Factory(httpFactory)
+            .setManifestParser(FastRefreshDashManifestParser())
+            .setFallbackTargetLiveOffsetMs(3_500L)
+            .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(2))
+    }
+
+    val fastHlsMediaSourceFactory = remember {
+        HlsMediaSource.Factory(httpFactory)
+            .setAllowChunklessPreparation(true)
+            .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(2))
+    }
+
+    val isWeakDevice = remember(preferences.lowEndDeviceMode) {
+        preferences.lowEndDeviceMode
+    }
+
+    val player = remember {
+        val bp = preferences.bufferProfile
+        val safeTargetBytes = bp.targetBufferBytes.coerceAtLeast(28 * 1024 * 1024)
+
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                bp.minBufferMs.coerceIn(10_000, 20_000),
+                bp.maxBufferMs.coerceIn(30_000, 60_000),
+                bp.playbackBufferMs.coerceIn(220, 420),
+                bp.rebufferMs.coerceIn(950, 1_600)
+            )
+            .setTargetBufferBytes(safeTargetBytes)
+            .setPrioritizeTimeOverSizeThresholds(true)
+            .setBackBuffer(bp.backBufferMs.coerceIn(6_000, 14_000), true)
+            .build()
+
+        // Dynamic Hardware + Software MediaCodec Selector:
+        // Reads forceExoSoftwareCodec dynamically so switching to software decoding takes effect in <5ms!
+        val smartCodecSelector = MediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
+            val allDecoders = MediaCodecSelector.DEFAULT.getDecoderInfos(
+                mimeType,
+                requiresSecureDecoder,
+                requiresTunnelingDecoder
+            )
+            if (allDecoders.size <= 1) {
+                allDecoders
+            } else {
+                val (swList, hwList) = allDecoders.partition { info ->
+                    val lowName = info.name.lowercase()
+                    info.softwareOnly ||
+                        lowName.startsWith("omx.google.") ||
+                        lowName.startsWith("c2.android.") ||
+                        lowName.contains(".sw.") ||
+                        lowName.contains("ffmpeg")
+                }
+                if (forceExoSoftwareCodec.get()) {
+                    swList + hwList
+                } else {
+                    hwList + swList
+                }
+            }
+        }
+
+        val renderersFactory = DefaultRenderersFactory(context).apply {
+            setMediaCodecSelector(smartCodecSelector)
+            setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
+            setEnableDecoderFallback(true)
+            setEnableAudioFloatOutput(false)
+            setEnableAudioTrackPlaybackParams(false)
+        }
+
+        val trackSelector = DefaultTrackSelector(context).apply {
+            val paramsBuilder = buildUponParameters()
+                .setAllowVideoMixedMimeTypeAdaptiveness(true)
+                .setAllowVideoNonSeamlessAdaptiveness(true)
+                .setAllowAudioMixedMimeTypeAdaptiveness(true)
+                .setAllowAudioMixedSampleRateAdaptiveness(true)
+                .setAllowAudioMixedChannelCountAdaptiveness(true)
+                .setAllowAudioNonSeamlessAdaptiveness(true)
+                .setExceedRendererCapabilitiesIfNecessary(true)
+                .setExceedVideoConstraintsIfNecessary(true)
+                .setExceedAudioConstraintsIfNecessary(true)
+            setParameters(paramsBuilder)
+        }
+
+        ExoPlayer.Builder(context, renderersFactory)
+            .setTrackSelector(trackSelector)
+            .setMediaSourceFactory(defaultMediaSourceFactory)
+            .setLoadControl(loadControl)
+            .setSeekParameters(SeekParameters.CLOSEST_SYNC)
+            .build()
+    }
+
+    var activeEngine by remember(preferences.playerEngine) {
+        mutableStateOf(preferences.playerEngine)
+    }
+    val vlcAvailable = remember { VlcEngineBridge.isLibVlcRuntimeAvailable() }
+    LaunchedEffect(vlcAvailable) {
+        if (vlcAvailable) {
+            withContext(Dispatchers.IO) {
+                VlcEngineBridge.getOrCreateSharedLibVlc(context)
+            }
+        }
+    }
+    var vlcFallbackToExo by remember(channel.stableKey, activeEngine) { mutableStateOf(false) }
+    val useVlcEngine = remember(activeEngine, vlcAvailable, vlcFallbackToExo, codecRequiresVlc) {
+        vlcAvailable && !vlcFallbackToExo && (
+            activeEngine == InternalPlayerEngine.VLC_PLAYER ||
+                codecRequiresVlc
+            )
+    }
+    val vlcController = remember {
+        EmbeddedVlcController(context).apply {
+            onBufferingChanged = { buffering -> isBuffering = buffering }
+            onPlayingChanged = { playing ->
+                isPlaying = playing
+                if (playing) {
+                    isBuffering = false
+                    errorMessage = null
+                }
+            }
+            onVoutStarted = {
+                isBuffering = false
+                errorMessage = null
+            }
+            onErrorOccurred = { reason ->
+                if (reason == "VLC_INIT_FAILED") {
+                    vlcFallbackToExo = true
+                } else {
+                    lastErrorCodeName = reason
+                    fastFallbackTriggered = true
+                    errorMessage = AppStrings.tr(
+                        lang,
+                        "جارٍ التبديل للرابط البديل (${candidateIndex + 1}/${formatCandidateUrls.size})...",
+                        "Passage au flux alternatif (${candidateIndex + 1}/${formatCandidateUrls.size})...",
+                        "Switching to alternate stream (${candidateIndex + 1}/${formatCandidateUrls.size})..."
+                    )
+                }
+            }
+        }
+    }
+    DisposableEffect(vlcController) {
+        onDispose {
+            vlcController.release()
+        }
+    }
+
+    LaunchedEffect(player, vlcController, playbackSpeed, useVlcEngine) {
+        player.playbackParameters = PlaybackParameters(playbackSpeed.speed)
+        if (useVlcEngine) {
+            vlcController.setRate(playbackSpeed.speed)
+        }
+    }
+
+    LaunchedEffect(player, vlcController, channel.stableKey, effectiveUrl, formatAttemptMode, retryCount, useVlcEngine, forceVlcSoftwareVideo) {
+        val sessionId = PlaybackSessionGuard.beginSession(channel.stableKey)
+        isBuffering = true
+        errorMessage = null
+        showControls = false
+        player.stop()
+        player.clearMediaItems()
+
+        val rotatedUa = channel.userAgent?.takeIf { it.isNotBlank() }
+            ?: STREAM_USER_AGENTS[retryCount % STREAM_USER_AGENTS.size]
+
+        val fastSpec = StreamFormatDetectorAndRenewer.detectFastFromUrlAndMetadata(channel, effectiveUrl, rotatedUa)
+
+        if (!PlaybackSessionGuard.isSessionCurrent(sessionId, channel.stableKey)) {
+            return@LaunchedEffect
+        }
+
+        detectedSpecLabel = "${fastSpec.containerFormat} • ${fastSpec.videoCodecHint}"
+        val targetPlayUrl = effectiveUrl.trim()
+        val low = targetPlayUrl.lowercase().substringBefore("?")
+        val fullLow = targetPlayUrl.lowercase()
+
+        val isMpdStream = fastSpec.mimeType == MimeTypes.APPLICATION_MPD ||
+            low.endsWith(".mpd") || fullLow.contains("format=mpd") || fullLow.contains("type=mpd")
+        val isExplicitHlsUrl = low.endsWith(".m3u8") ||
+            fullLow.contains("output=m3u8") || fullLow.contains("type=m3u8") || fullLow.contains("output=hls")
+        val isVodFile = channel.contentType != StreamContentType.LIVE_TV ||
+            low.endsWith(".mp4") || low.endsWith(".mkv") || low.endsWith(".avi") ||
+            low.endsWith(".mov") || low.endsWith(".webm") || low.endsWith(".flv")
+
+        // Direct, clean HTTP headers (no synthetic Origin/Referer on video streams so 302 edge redirects never fail!)
+        val customHeaders = IboPlayerProfileSpoofer.buildStreamHeadersMap(
+            targetUrl = targetPlayUrl,
+            serverBaseUrl = channel.streamBaseUrl,
+            customReferer = channel.referer,
+            customOrigin = channel.origin,
+            customCookie = channel.cookie,
+            isLiveManifest = false
+        )
+        httpFactory.setDefaultRequestProperties(customHeaders)
+        httpFactory.setUserAgent(rotatedUa)
+
+        val itemBuilder = MediaItem.Builder()
+            .setUri(Uri.parse(targetPlayUrl))
+
+        if (channel.drmKey.startsWith("http://", ignoreCase = true) || channel.drmKey.startsWith("https://", ignoreCase = true)) {
+            itemBuilder.setDrmConfiguration(
+                MediaItem.DrmConfiguration.Builder(C.WIDEVINE_UUID)
+                    .setLicenseUri(channel.drmKey.trim())
+                    .setMultiSession(false)
+                    .build()
+            )
+        }
+
+        if (!isVodFile) {
+            // Lock live playback speed strictly at 1.0f (native broadcast frame rate) with a responsive 3.8s target offset
+            // so HLS/TS channels start on the very first segment (<350ms) and NEVER speed-warp or stutter!
+            val targetOffset = when {
+                isMpdStream -> 3_200L
+                retryCount > 0 -> 6_500L
+                else -> 3_800L
+            }
+            val liveConfig = MediaItem.LiveConfiguration.Builder()
+                .setTargetOffsetMs(targetOffset)
+                .setMinOffsetMs(1_500L)
+                .setMaxOffsetMs(60_000L)
+                .setMinPlaybackSpeed(1.0f)
+                .setMaxPlaybackSpeed(1.0f)
+                .build()
+            itemBuilder.setLiveConfiguration(liveConfig)
+        }
+
+        if (useVlcEngine && channel.drmKey.isBlank()) {
+            val startPos = if (isVodFile && !initialResumeApplied && initialResumePositionMs > 5_000L) {
+                initialResumeApplied = true
+                initialResumePositionMs
+            } else 0L
+            val swMode = forceVlcSoftwareVideo || preferences.preferSoftwareDecoder
+            detectedSpecLabel = "VLC All-Codec • ${fastSpec.containerFormat} • ${fastSpec.videoCodecHint}"
+            vlcController.playStreamSuspend(
+                url = targetPlayUrl,
+                userAgent = rotatedUa,
+                referer = channel.referer,
+                cookie = channel.cookie,
+                isVod = isVodFile,
+                forceSoftwareVideo = swMode,
+                startPositionMs = startPos
+            )
+            return@LaunchedEffect
+        } else {
+            vlcController.stop()
+        }
+
+        // Direct & flexible format adaptation (v23.0):
+        // - Mode 0: Only set explicit MimeType for manifest protocols (.m3u8, .mpd, .ism, rtsp://).
+        //   For ALL progressive files (.mp4, .mkv, .avi, .flv, .mov, .webm, .ts), leave mimeType null so
+        //   DefaultExtractorsFactory sniffs the actual file magic bytes (ftyp, EBML, RIFF, 0x47) in <1ms!
+        when (formatAttemptMode) {
+            1 -> itemBuilder.setMimeType(MimeTypes.APPLICATION_M3U8)
+            2 -> itemBuilder.setMimeType(MimeTypes.VIDEO_MP2T)
+            3 -> {
+                // Pure byte-sniffing via DefaultExtractorsFactory without forced MimeType
+            }
+            else -> {
+                when {
+                    isMpdStream -> itemBuilder.setMimeType(MimeTypes.APPLICATION_MPD)
+                    isExplicitHlsUrl -> itemBuilder.setMimeType(MimeTypes.APPLICATION_M3U8)
+                    low.contains(".ism") -> itemBuilder.setMimeType(MimeTypes.APPLICATION_SS)
+                    low.startsWith("rtsp://") -> itemBuilder.setMimeType(MimeTypes.APPLICATION_RTSP)
+                }
+            }
+        }
+
+        val mediaItem = itemBuilder.build()
+        val clearKeyManager = if (channel.drmKey.isNotBlank() && !channel.drmKey.startsWith("http", ignoreCase = true)) {
+            buildClearKeyDrmManager(channel.drmKey)
+        } else null
+
+        if (isMpdStream) {
+            val dashFactory = if (clearKeyManager != null) {
+                DashMediaSource.Factory(httpFactory)
+                    .setManifestParser(FastRefreshDashManifestParser())
+                    .setFallbackTargetLiveOffsetMs(2_800L)
+                    .setDrmSessionManagerProvider { clearKeyManager }
+                    .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(6))
+            } else {
+                fastDashMediaSourceFactory
+            }
+            player.setMediaSource(dashFactory.createMediaSource(mediaItem))
+        } else if (clearKeyManager != null) {
+            val drmDefaultFactory = DefaultMediaSourceFactory(context, extractorsFactory)
+                .setDataSourceFactory(httpFactory)
+                .setDrmSessionManagerProvider { clearKeyManager }
+                .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(6))
+            player.setMediaSource(drmDefaultFactory.createMediaSource(mediaItem))
+        } else if ((isExplicitHlsUrl && formatAttemptMode == 0) || formatAttemptMode == 1) {
+            // Chunkless HLS preparation opens .m3u8 live channels 2x faster!
+            player.setMediaSource(fastHlsMediaSourceFactory.createMediaSource(mediaItem))
+        } else {
+            player.setMediaSource(defaultMediaSourceFactory.createMediaSource(mediaItem))
+        }
+
+        if (isVodFile && !initialResumeApplied && initialResumePositionMs > 5_000L) {
+            initialResumeApplied = true
+            player.seekTo(initialResumePositionMs)
+        }
+        player.playWhenReady = true
+        player.prepare()
+    }
+
+    // Active Android TV & Phone Buffering Watchdog Timer:
+    // If a stream URL accepts the TCP connection but stalls in STATE_BUFFERING for >6.5 seconds without starting video,
+    // automatically switch to the next format candidate (.m3u8 <-> .ts <-> extensionless / next User-Agent) so the spinner NEVER hangs!
+    LaunchedEffect(player, channel.stableKey, candidateIndex, formatAttemptMode, retryCount, isBuffering, useVlcEngine) {
+        if (!isBuffering || useVlcEngine) return@LaunchedEffect
+        delay(if (channel.contentType == StreamContentType.LIVE_TV) 4_200L else 5_500L)
+        if (isBuffering && player.playbackState == Player.STATE_BUFFERING && !player.isPlaying && errorMessage == null) {
+            if (retryCount < preferences.maxReconnectRetries) {
+                TiviMateDiagnostics.logEvent("⚡ مؤقت الحماية الذكي: تبديل فوري للرابط البديل للقناة [${channel.name}] بعد تأخر استجابة البث")
+                retryCount += 1
+                if (formatCandidateUrls.size > 1) {
+                    formatAttemptMode = 0
+                    candidateIndex = (candidateIndex + 1) % formatCandidateUrls.size
+                } else {
+                    formatAttemptMode = (formatAttemptMode + 1) % 4
+                }
+            }
+        }
+    }
+
+    // Silent Black-Screen Watchdog for ExoPlayer (v23.0):
+    // On many Android TV boxes, hardware MediaCodec accepts 1080i/HEVC-10bit/MPEG-2/High10 streams, enters STATE_READY,
+    // plays audio, and outputs 0 video frames (black screen). If STATE_READY has 0 video frames after 2.0s,
+    // immediately hand over to LibVLC 4-Core FFmpeg software decoding!
+    LaunchedEffect(player, channel.stableKey, effectiveUrl, retryCount, isBuffering, useVlcEngine) {
+        if (useVlcEngine || !vlcAvailable || channel.drmKey.isNotBlank()) return@LaunchedEffect
+        delay(2_000L)
+        val noVideoRendered = player.videoSize.width <= 0 ||
+            (player.videoDecoderCounters?.renderedOutputBufferCount ?: 0) <= 0
+        if (!useVlcEngine && !isBuffering && (player.playbackState == Player.STATE_READY || player.isPlaying) && noVideoRendered) {
+            TiviMateDiagnostics.logEvent("⚡ معالجة الشاشة السوداء الصامتة لـ [${channel.name}] — تشغيل فوري بمحرك الكوديك الشامل FFmpeg/VLC")
+            forceExoSoftwareCodec.set(true)
+            forceVlcSoftwareVideo = true
+            codecRequiresVlc = true
+        }
+    }
+
+    // LibVLC Hardware->FFmpeg Watchdog (v23.0):
+    // If LibVLC started with hardware MediaCodec enabled and no video frame (Vout) appears within 2.2s,
+    // automatically switch LibVLC to 4-thread FFmpeg software video decoding!
+    LaunchedEffect(useVlcEngine, channel.stableKey, effectiveUrl, forceVlcSoftwareVideo) {
+        if (!useVlcEngine || forceVlcSoftwareVideo) return@LaunchedEffect
+        delay(2_200L)
+        if (useVlcEngine && !vlcController.hasRenderedVout) {
+            TiviMateDiagnostics.logEvent("⚡ تفعيل معالج الفيديو البرمجي الشامل (FFmpeg 4-Core) داخل VLC لـ [${channel.name}]")
+            forceVlcSoftwareVideo = true
+        }
+    }
+
+    // Smart Ticker: updates network speed ONLY when controls/buffering are visible (zero recomposition during fullscreen video!)
+    LaunchedEffect(player, channel.stableKey) {
+        var tickCount = 0
+        while (true) {
+            delay(1200L)
+            if (showControls || isBuffering || errorMessage != null) {
+                val sampled = NetworkSpeedMonitor.sampleCurrentSpeedLabel()
+                if (sampled != networkSpeedLabel) networkSpeedLabel = sampled
+            }
+            if (channel.contentType != StreamContentType.LIVE_TV) {
+                val pos = if (useVlcEngine) vlcController.getTimeMs() else player.currentPosition.coerceAtLeast(0L)
+                val dur = if (useVlcEngine) vlcController.getLengthMs() else player.duration.let { if (it == C.TIME_UNSET || it < 0L) 0L else it }
+                vodPositionMs = pos
+                if (dur > 0L) vodDurationMs = dur
+                tickCount++
+                if (tickCount % 3 == 0 && pos >= 5_000L) {
+                    onSaveVodProgress(channel, pos, vodDurationMs)
+                }
+            }
+        }
+    }
+
+    DisposableEffect(player) {
+        val listener = object : Player.Listener {
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                isBuffering = playbackState == Player.STATE_BUFFERING
+                if (playbackState == Player.STATE_READY) {
+                    errorMessage = null
+                    lastErrorCodeName = ""
+                    fastFallbackTriggered = false
+                    retryCount = 0
+                    currentTracksSnapshot = player.currentTracks
+                } else if (playbackState == Player.STATE_ENDED && preferences.autoReconnect &&
+                    channel.contentType == StreamContentType.LIVE_TV
+                ) {
+                    player.seekToDefaultPosition()
+                    player.prepare()
+                    player.play()
+                }
+            }
+
+            override fun onTracksChanged(tracks: Tracks) {
+                currentTracksSnapshot = tracks
+                var vCodecLabel = ""
+                var aCodecLabel = ""
+                var hasVideoTrack = false
+                var hasSupportedVideoTrack = false
+                var hasAudioTrack = false
+                var hasSupportedAudioTrack = false
+                var fallbackSupportedAudioGroup: Tracks.Group? = null
+                var fallbackSupportedAudioIndex = -1
+
+                for (group in tracks.groups) {
+                    if (group.type == C.TRACK_TYPE_VIDEO) {
+                        hasVideoTrack = true
+                        for (i in 0 until group.length) {
+                            if (group.isTrackSupported(i)) {
+                                hasSupportedVideoTrack = true
+                            }
+                            if (group.isTrackSelected(i) && vCodecLabel.isEmpty()) {
+                                val fmt = group.getTrackFormat(i)
+                                val mime = fmt.sampleMimeType.orEmpty().lowercase()
+                                vCodecLabel = when {
+                                    mime.contains("hevc") || mime.contains("h265") -> "HEVC/H.265"
+                                    mime.contains("avc") || mime.contains("h264") -> "H.264/AVC"
+                                    mime.contains("av01") || mime.contains("av1") -> "AV1"
+                                    mime.contains("vp9") -> "VP9"
+                                    mime.contains("mp2") || mime.contains("mpeg2") -> "MPEG-2"
+                                    mime.contains("mp4v") || mime.contains("xvid") -> "MPEG-4/XviD"
+                                    mime.isNotBlank() -> mime.substringAfter("/").uppercase()
+                                    else -> ""
+                                }
+                            }
+                        }
+                    } else if (group.type == C.TRACK_TYPE_AUDIO) {
+                        hasAudioTrack = true
+                        for (i in 0 until group.length) {
+                            if (group.isTrackSupported(i)) {
+                                hasSupportedAudioTrack = true
+                                if (fallbackSupportedAudioGroup == null) {
+                                    fallbackSupportedAudioGroup = group
+                                    fallbackSupportedAudioIndex = i
+                                }
+                            }
+                            if (group.isTrackSelected(i) && aCodecLabel.isEmpty()) {
+                                val fmt = group.getTrackFormat(i)
+                                val mime = fmt.sampleMimeType.orEmpty().lowercase()
+                                aCodecLabel = when {
+                                    mime.contains("eac3") -> "E-AC3"
+                                    mime.contains("ac3") -> "AC3"
+                                    mime.contains("mp4a") || mime.contains("aac") -> "AAC"
+                                    mime.contains("opus") -> "Opus"
+                                    mime.contains("mpeg-l2") || mime.contains("mp2") -> "MP2"
+                                    mime.contains("mpeg") || mime.contains("mp3") -> "MP3"
+                                    mime.contains("dts") -> "DTS"
+                                    mime.contains("flac") -> "FLAC"
+                                    mime.contains("vorbis") -> "Vorbis"
+                                    mime.isNotBlank() -> mime.substringAfter("/").uppercase()
+                                    else -> ""
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Instant Audio/Video Codec Handover (<30ms):
+                // 1) If a movie/channel has multiple audio tracks and the default selected one is unsupported,
+                //    immediately switch to the first supported audio track!
+                if (hasAudioTrack && hasSupportedAudioTrack && fallbackSupportedAudioGroup != null && fallbackSupportedAudioIndex >= 0) {
+                    val anySelectedAudioSupported = tracks.groups.any { g ->
+                        g.type == C.TRACK_TYPE_AUDIO && (0 until g.length).any { idx -> g.isTrackSelected(idx) && g.isTrackSupported(idx) }
+                    }
+                    if (!anySelectedAudioSupported) {
+                        player.trackSelectionParameters = player.trackSelectionParameters
+                            .buildUpon()
+                            .setOverrideForType(
+                                TrackSelectionOverride(fallbackSupportedAudioGroup.mediaTrackGroup, listOf(fallbackSupportedAudioIndex))
+                            )
+                            .build()
+                    }
+                }
+
+                // 2) If video or audio codec is unsupported by Android MediaCodec (e.g. AC3/E-AC3/DTS/MP2/MPEG-2/10-bit/XviD)
+                //    and LibVLC is available, switch to VLC Engine IMMEDIATELY and permanently for this item!
+                val videoUnsupported = hasVideoTrack && !hasSupportedVideoTrack
+                val audioUnsupported = hasAudioTrack && !hasSupportedAudioTrack
+                if ((videoUnsupported || audioUnsupported) && vlcAvailable && !useVlcEngine && !vlcFallbackToExo) {
+                    if (videoUnsupported) {
+                        forceExoSoftwareCodec.set(true)
+                        forceVlcSoftwareVideo = true
+                    }
+                    codecRequiresVlc = true
+                    player.stop()
+                }
+
+                val combinedCodec = listOfNotNull(
+                    vCodecLabel.takeIf { it.isNotBlank() },
+                    aCodecLabel.takeIf { it.isNotBlank() }
+                ).joinToString(" • ")
+                if (combinedCodec.isNotBlank()) {
+                    detectedSpecLabel = combinedCodec
+                }
+            }
+
+            override fun onIsPlayingChanged(playing: Boolean) {
+                isPlaying = playing
+                if (!playing && channel.contentType != StreamContentType.LIVE_TV) {
+                    val pos = player.currentPosition.coerceAtLeast(0L)
+                    val dur = player.duration.let { if (it == C.TIME_UNSET || it < 0L) vodDurationMs else it }
+                    if (pos >= 5_000L) {
+                        onSaveVodProgress(channel, pos, dur)
+                    }
+                }
+            }
+
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                if (videoSize.width > 0 && videoSize.height > 0) {
+                    val tag = when {
+                        videoSize.height >= 2160 -> "4K UHD"
+                        videoSize.height >= 1080 -> "1080p FHD"
+                        videoSize.height >= 720 -> "720p HD"
+                        else -> "${videoSize.height}p SD"
+                    }
+                    videoResolutionLabel = "${videoSize.width}×${videoSize.height} • $tag"
+                }
+            }
+
+            override fun onPlayerError(error: PlaybackException) {
+                if (error.errorCode == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW) {
+                    player.seekToDefaultPosition()
+                    player.prepare()
+                    player.play()
+                } else if (
+                    error.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED ||
+                    error.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED ||
+                    error.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED
+                ) {
+                    lastErrorCodeName = error.errorCodeName
+                    forceExoSoftwareCodec.set(true)
+                    forceVlcSoftwareVideo = true
+                    if (vlcAvailable && !vlcFallbackToExo) {
+                        codecRequiresVlc = true
+                    } else {
+                        fastFallbackTriggered = true
+                        errorMessage = AppStrings.tr(
+                            lang,
+                            "جارٍ تشغيل المحتوى بالمعالج البرمجي الشامل...",
+                            "Ouverture via le décodeur logiciel...",
+                            "Opening via software codec engine..."
+                        )
+                    }
+                    TiviMateDiagnostics.logEvent("⚠️ فشل فك الترميز العتادي لـ [${channel.name}] (${error.errorCodeName}) — تفعيل محرك الكوديك الشامل فوراً")
+                } else if (
+                    (error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED ||
+                        error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED) &&
+                    channel.contentType != StreamContentType.LIVE_TV &&
+                    vlcAvailable && !useVlcEngine && !vlcFallbackToExo
+                ) {
+                    // VOD movie/series container (e.g. MKV/AVI/FLV/MP4 variant) rejected by Media3 extractor:
+                    // Open immediately in LibVLC FFmpeg demuxer without wasting a retry!
+                    lastErrorCodeName = error.errorCodeName
+                    forceVlcSoftwareVideo = true
+                    codecRequiresVlc = true
+                } else {
+                    lastErrorCodeName = error.errorCodeName
+                    if (error.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS) {
+                        ChannelRepository.clearHostSessionCookies(effectiveUrl)
+                        ChannelRepository.clearStreamRedirectCache(effectiveUrl)
+                    }
+                    fastFallbackTriggered = (
+                        error.errorCode == PlaybackException.ERROR_CODE_PARSING_MANIFEST_MALFORMED ||
+                            error.errorCode == PlaybackException.ERROR_CODE_PARSING_MANIFEST_UNSUPPORTED ||
+                            error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED ||
+                            error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED ||
+                            error.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS ||
+                            error.errorCode == PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND ||
+                            error.errorCode == PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE ||
+                            error.errorCode == PlaybackException.ERROR_CODE_IO_UNSPECIFIED
+                        )
+                    TiviMateDiagnostics.logEvent("⚡ تبديل فوري للصيغة البديلة (Rocket Fallback) لـ [${channel.name}]: ${error.errorCodeName}")
+                    errorMessage = AppStrings.tr(
+                        lang,
+                        "جارٍ فتح القناة بمحرك VLC البديل (${candidateIndex + 1}/${formatCandidateUrls.size})...",
+                        "Ouverture via moteur VLC alternatif (${candidateIndex + 1}/${formatCandidateUrls.size})...",
+                        "Opening via alternate VLC stream mode (${candidateIndex + 1}/${formatCandidateUrls.size})..."
+                    )
+                }
+            }
+        }
+        player.addListener(listener)
+        onDispose {
+            if (channel.contentType != StreamContentType.LIVE_TV) {
+                val pos = player.currentPosition.coerceAtLeast(0L)
+                val dur = player.duration.let { if (it == C.TIME_UNSET || it < 0L) vodDurationMs else it }
+                if (pos >= 5_000L) {
+                    onSaveVodProgress(channel, pos, dur)
+                }
+            }
+            ChannelRepository.cancelPendingStreamRequests()
+            player.removeListener(listener)
+            player.stop()
+            player.clearMediaItems()
+            player.release()
+        }
+    }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, player) {
+        var wasPlayingBeforeBackground = false
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_STOP -> {
+                    wasPlayingBeforeBackground = player.isPlaying || player.playWhenReady
+                    if (channel.contentType != StreamContentType.LIVE_TV) {
+                        val pos = player.currentPosition.coerceAtLeast(0L)
+                        val dur = player.duration.let { if (it == C.TIME_UNSET || it < 0L) vodDurationMs else it }
+                        if (pos >= 5_000L) {
+                            onSaveVodProgress(channel, pos, dur)
+                        }
+                    }
+                    if (activity?.isInPictureInPictureMode != true) {
+                        player.pause()
+                    }
+                }
+                Lifecycle.Event.ON_START -> {
+                    if (wasPlayingBeforeBackground) {
+                        if (channel.contentType == StreamContentType.LIVE_TV && player.playbackState == Player.STATE_IDLE) {
+                            player.prepare()
+                        }
+                        player.play()
+                    }
+                }
+                else -> {}
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    var playerDiagnosticAlert by remember(channel.stableKey) { mutableStateOf<DiagnosticAlertInfo?>(null) }
+
+    LaunchedEffect(channel.stableKey, errorMessage, retryCount) {
+        if (errorMessage != null && preferences.autoReconnect) {
+            if (retryCount >= preferences.maxReconnectRetries) {
+                val accName = matchingAccount?.serverName?.ifBlank { channel.playlistName } ?: channel.playlistName
+                val accExp = matchingAccount?.expDate.orEmpty()
+                playerDiagnosticAlert = when {
+                    accExp.isNotBlank() && ExpiryAlertHelper.isDateAlreadyExpired(accExp) -> DiagnosticAlertInfo(
+                        type = DiagnosticAlertType.ACCOUNT_EXPIRED,
+                        title = "⚠️ انتهت صلاحية حساب القنوات ($accName)",
+                        message = "انتهت فترة اشتراك القائمة ($accName) بتاريخ $accExp.\nيرجى تجديد اشتراك الحساب عبر التواصل مع مزود الخدمة ($ALI_SAT_PROVIDER_NAME : $ALI_SAT_PHONE_NUMBER) أو تحديث بيانات القائمة من فضاء الزبون.",
+                        sourceName = accName,
+                        expDate = accExp
+                    )
+                    !ExpiryAlertHelper.isInternetAvailable(context) -> DiagnosticAlertInfo(
+                        type = DiagnosticAlertType.INTERNET_ERROR,
+                        title = "📡 تنبيه: مشكلة في اتصال الإنترنت لديك",
+                        message = "تعذّر الوصول إلى البث بسبب انقطاع أو ضعف في اتصال الإنترنت على جهازك.\nيرجى التحقق من شبكة الواي فاي (Wi-Fi) أو كابل الإنترنت والراوتر ثم المحاولة مجدداً.",
+                        sourceName = accName
+                    )
+                    else -> DiagnosticAlertInfo(
+                        type = DiagnosticAlertType.SERVER_OUTAGE,
+                        title = "🛠️ تنبيه حالة الخادم: انقطاع مؤقت من المصدر",
+                        message = "يتعذّر استجابة خادم البث للقناة (${channel.name}) حالياً.\n\nيرجى التريث لمدة ساعة، ثم غلق جهاز الراوتر (المودم) وإعادة فتحه مجدداً.\nإذا لم يعد السيرفر للعمل تلقائياً، يرجى التواصل مع مزود الخدمة ($ALI_SAT_PROVIDER_NAME : $ALI_SAT_PHONE_NUMBER).",
+                        sourceName = accName
+                    )
+                }
+                errorMessage = AppStrings.tr(
+                    lang,
+                    "تعذّر فتح البث حالياً ($lastErrorCodeName)",
+                    "Échec de lecture ($lastErrorCodeName)",
+                    "Playback failed ($lastErrorCodeName)"
+                )
+                return@LaunchedEffect
+            }
+            val backoffMs = if (fastFallbackTriggered) 35L else (180L * (retryCount + 1)).coerceAtMost(1_200L)
+            delay(backoffMs)
+            if (channel.contentType == StreamContentType.MOVIE && channel.streamId > 0 && resolvedVodUrl == null) {
+                val realUrl = XtreamRepository.resolveVodRealUrlIfNeeded(channel, matchingAccount)
+                if (!realUrl.isNullOrBlank() && realUrl != effectiveUrl) {
+                    resolvedVodUrl = realUrl
+                    candidateIndex = 0
+                    formatAttemptMode = 0
+                    errorMessage = null
+                    retryCount += 1
+                    return@LaunchedEffect
+                }
+            }
+            retryCount += 1
+
+            if (
+                fastFallbackTriggered &&
+                formatAttemptMode == 0 &&
+                effectiveUrl.contains(".m3u8", ignoreCase = true)
+            ) {
+                // Server returned raw MPEG-TS or MP4 bytes on a .m3u8 URL: immediately open with progressive extractor (mode 2)!
+                formatAttemptMode = 2
+            } else if (
+                fastFallbackTriggered &&
+                formatAttemptMode == 0 &&
+                !effectiveUrl.contains(".m3u8", ignoreCase = true) &&
+                channel.contentType == StreamContentType.LIVE_TV
+            ) {
+                // Server returned an #EXTM3U playlist on a .ts or extensionless URL: immediately open as HLS (mode 1)!
+                formatAttemptMode = 1
+            } else if (formatCandidateUrls.size > 1) {
+                formatAttemptMode = 0
+                candidateIndex = (candidateIndex + 1) % formatCandidateUrls.size
+            } else if (formatAttemptMode < 2) {
+                formatAttemptMode += 1
+            } else {
+                formatAttemptMode = 0
+                errorMessage = null
+                if (channel.contentType == StreamContentType.LIVE_TV) {
+                    player.seekToDefaultPosition()
+                }
+                player.prepare()
+                player.play()
+            }
+        }
+    }
+
+    LaunchedEffect(numberInputBuffer) {
+        if (numberInputBuffer.isNotEmpty()) {
+            delay(950L)
+            val targetNum = numberInputBuffer.toIntOrNull()
+            numberInputBuffer = ""
+            if (targetNum != null) {
+                val match = siblingChannels.find { it.number == targetNum }
+                    ?: allChannels.find { it.number == targetNum }
+                if (match != null) {
+                    showControls = false
+                    onSelectChannel(match)
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(showControls, isPlaying, showQuickDrawer, showTracksDialog, vodPositionMs) {
+        if (showControls && isPlaying && !showQuickDrawer && !showTracksDialog && errorMessage == null) {
+            delay(if (channel.contentType != StreamContentType.LIVE_TV) 6200L else 4000L)
+            if (isPlaying) {
+                showControls = false
+            }
+        }
+    }
+
+    BackHandler {
+        when {
+            showTracksDialog -> showTracksDialog = false
+            showQuickDrawer -> showQuickDrawer = false
+            showControls -> showControls = false
+            else -> onBack()
+        }
+    }
+
+    fun currentVodPositionMs(): Long {
+        return if (useVlcEngine) {
+            vlcController.getTimeMs().coerceAtLeast(0L)
+        } else {
+            player.currentPosition.coerceAtLeast(0L)
+        }
+    }
+
+    fun seekVodTo(targetMs: Long) {
+        val safeTarget = if (vodDurationMs > 0L) {
+            targetMs.coerceIn(0L, vodDurationMs)
+        } else {
+            targetMs.coerceAtLeast(0L)
+        }
+        vodPositionMs = safeTarget
+        if (useVlcEngine) {
+            vlcController.setTimeMs(safeTarget)
+        } else {
+            player.seekTo(safeTarget)
+        }
+    }
+
+    fun seekVodByOffset(deltaMs: Long) {
+        seekVodTo(currentVodPositionMs() + deltaMs)
+    }
+
+    fun switchRelativeChannel(offset: Int) {
+        if (!SafeClickGuard.allowAction("PLAYER_ZAP", 240L)) return
+        val list = siblingChannels.ifEmpty { allChannels }
+        if (list.size <= 1) return
+        val idx = list.indexOfFirst { it.stableKey == channel.stableKey }
+        if (idx == -1) return
+        val nextIdx = (idx + offset + list.size) % list.size
+        showControls = false
+        onSelectChannel(list[nextIdx])
+    }
+
+    BoxWithConstraints(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            .focusRequester(rootPlayerFocusRequester)
+            .focusable()
+            .onKeyEvent { event ->
+                if (showQuickDrawer || showTracksDialog) {
+                    return@onKeyEvent false
+                }
+                if (event.nativeKeyEvent.action == KeyEvent.ACTION_DOWN) {
+                    val code = event.nativeKeyEvent.keyCode
+                    if (code in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9) {
+                        val digit = (code - KeyEvent.KEYCODE_0).toString()
+                        if (numberInputBuffer.length < 4) {
+                            numberInputBuffer += digit
+                        }
+                        return@onKeyEvent true
+                    }
+                    when (code) {
+                        KeyEvent.KEYCODE_DPAD_CENTER,
+                        KeyEvent.KEYCODE_ENTER -> {
+                            if (!showControls) {
+                                showControls = true
+                                true
+                            } else false
+                        }
+                        KeyEvent.KEYCODE_MENU,
+                        KeyEvent.KEYCODE_INFO -> {
+                            showControls = !showControls
+                            true
+                        }
+                        KeyEvent.KEYCODE_CHANNEL_UP -> {
+                            switchRelativeChannel(-1)
+                            true
+                        }
+                        KeyEvent.KEYCODE_CHANNEL_DOWN -> {
+                            switchRelativeChannel(1)
+                            true
+                        }
+                        KeyEvent.KEYCODE_DPAD_UP -> {
+                            if (!showControls) {
+                                switchRelativeChannel(-1)
+                                true
+                            } else false
+                        }
+                        KeyEvent.KEYCODE_DPAD_DOWN -> {
+                            if (!showControls) {
+                                switchRelativeChannel(1)
+                                true
+                            } else false
+                        }
+                        KeyEvent.KEYCODE_DPAD_LEFT -> {
+                            if (!showControls) {
+                                if (channel.contentType != StreamContentType.LIVE_TV) {
+                                    seekVodByOffset(-15_000L)
+                                } else {
+                                    drawerSelectedBouquet = channel.group
+                                    showQuickDrawer = true
+                                }
+                                true
+                            } else false
+                        }
+                        KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                            if (!showControls) {
+                                if (channel.contentType != StreamContentType.LIVE_TV) {
+                                    seekVodByOffset(15_000L)
+                                } else {
+                                    drawerSelectedBouquet = channel.group
+                                    showQuickDrawer = true
+                                }
+                                true
+                            } else false
+                        }
+                        KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
+                            if (useVlcEngine) {
+                                if (vlcController.isPlaying()) vlcController.pause() else vlcController.play()
+                            } else {
+                                if (player.isPlaying) player.pause() else player.play()
+                            }
+                            true
+                        }
+                        else -> false
+                    }
+                } else false
+            }
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null
+            ) {
+                if (showQuickDrawer) showQuickDrawer = false
+                else showControls = !showControls
+            }
+    ) {
+        val isPhoneLandscape = maxHeight < 460.dp
+
+        if (useVlcEngine && channel.drmKey.isBlank()) {
+            VlcEmbeddedVideoSurface(
+                controller = vlcController,
+                resizeMode = resizeMode,
+                modifier = Modifier.fillMaxSize()
+            )
+        } else {
+            AndroidView(
+                factory = { ctx ->
+                    PlayerView(ctx).apply {
+                        this.player = player
+                        this.useController = false
+                        this.resizeMode = resizeMode.exoMode
+                        this.keepScreenOn = true
+                        this.isFocusable = false
+                        this.isFocusableInTouchMode = false
+                        this.descendantFocusability = android.view.ViewGroup.FOCUS_BLOCK_DESCENDANTS
+                    }
+                },
+                update = { view ->
+                    view.player = player
+                    view.resizeMode = resizeMode.exoMode
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+
+        if (numberInputBuffer.isNotEmpty()) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(20.dp)
+                    .background(Color(0xEB101015), RoundedCornerShape(12.dp))
+                    .border(2.dp, BeinHighlightPurple, RoundedCornerShape(12.dp))
+                    .padding(horizontal = 18.dp, vertical = 8.dp)
+            ) {
+                Text(
+                    text = numberInputBuffer,
+                    color = Color.White,
+                    fontSize = if (isPhoneLandscape) 20.sp else 26.sp,
+                    fontWeight = FontWeight.ExtraBold
+                )
+            }
+        }
+
+        if (preferences.showNetworkSpeed && (showControls || showBufferingBadge)) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(start = 16.dp, top = if (showControls) 66.dp else 14.dp)
+                    .background(Color(0xE6101015), RoundedCornerShape(10.dp))
+                    .border(1.dp, EmeraldLive.copy(alpha = 0.7f), RoundedCornerShape(10.dp))
+                    .padding(horizontal = 10.dp, vertical = 4.dp)
+            ) {
+                Text(
+                    text = "🌐 ⬇ $networkSpeedLabel",
+                    color = EmeraldLive,
+                    fontSize = if (isPhoneLandscape) 10.sp else 12.sp,
+                    fontWeight = FontWeight.ExtraBold
+                )
+            }
+        }
+
+        if (showBufferingBadge || errorMessage != null) {
+            Row(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .background(Color(0xE8101015), RoundedCornerShape(24.dp))
+                    .border(1.5.dp, BeinHighlightPurple, RoundedCornerShape(24.dp))
+                    .padding(horizontal = 16.dp, vertical = 9.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                CircularProgressIndicator(
+                    color = Color.White,
+                    strokeWidth = 2.5.dp,
+                    modifier = Modifier.size(if (isPhoneLandscape) 18.dp else 22.dp)
+                )
+                Text(
+                    text = errorMessage ?: "⏳ جارٍ التحميل... (⬇ $networkSpeedLabel)",
+                    color = Color.White,
+                    fontSize = if (isPhoneLandscape) 11.sp else 13.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+
+        AnimatedVisibility(
+            visible = showControls,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier.fillMaxSize()
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.verticalGradient(
+                            colors = listOf(
+                                Color(0xE6030106),
+                                Color(0x22030106),
+                                Color(0x22030106),
+                                Color(0xF0030106)
+                            )
+                        )
+                    )
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .align(Alignment.TopCenter)
+                        .padding(
+                            horizontal = if (isPhoneLandscape) 12.dp else 20.dp,
+                            vertical = if (isPhoneLandscape) 6.dp else 14.dp
+                        ),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        FocusableCircleButton(
+                            onClick = onBack,
+                            icon = Icons.Default.ArrowBack,
+                            contentDescription = "رجوع",
+                            sizeDp = if (isPhoneLandscape) 36.dp else 44.dp
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        ChannelAvatar(
+                            name = channel.name,
+                            logoUrl = channel.logo,
+                            modifier = Modifier.size(if (isPhoneLandscape) 42.dp else 54.dp),
+                            cornerRadius = 11.dp,
+                            innerPadding = 2.dp
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = channel.name,
+                                color = Color.White,
+                                fontSize = if (isPhoneLandscape) 15.sp else 19.sp,
+                                fontWeight = FontWeight.ExtraBold,
+                                maxLines = 1,
+                                modifier = Modifier.basicMarquee()
+                            )
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text(
+                                    text = channel.group,
+                                    color = Color(0xFFE2E8F0),
+                                    fontSize = if (isPhoneLandscape) 11.sp else 13.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                if (videoResolutionLabel.isNotBlank() || detectedSpecLabel.isNotBlank()) {
+                                    Text(
+                                        text = listOfNotNull(
+                                            videoResolutionLabel.takeIf { it.isNotBlank() },
+                                            detectedSpecLabel.takeIf { it.isNotBlank() }
+                                        ).joinToString(" • "),
+                                        color = EmeraldLive,
+                                        fontSize = if (isPhoneLandscape) 10.sp else 12.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FocusableCircleButton(
+                            onClick = { onToggleFavorite(channel) },
+                            icon = if (isFavorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                            tint = if (isFavorite) Color(0xFFFF4D6D) else Color.White,
+                            contentDescription = "المفضلة",
+                            sizeDp = if (isPhoneLandscape) 36.dp else 44.dp
+                        )
+
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && activity != null) {
+                            FocusableCircleButton(
+                                onClick = {
+                                    runCatching {
+                                        val params = PictureInPictureParams.Builder()
+                                            .setAspectRatio(Rational(16, 9))
+                                            .build()
+                                        activity.enterPictureInPictureMode(params)
+                                    }
+                                },
+                                icon = Icons.Default.ExitToApp,
+                                contentDescription = "PiP",
+                                sizeDp = if (isPhoneLandscape) 36.dp else 44.dp
+                            )
+                        }
+
+                        FocusableCircleButton(
+                            onClick = {
+                                showControls = false
+                                drawerSelectedBouquet = channel.group
+                                showQuickDrawer = true
+                            },
+                            icon = Icons.Default.List,
+                            contentDescription = "الباقات والقنوات",
+                            sizeDp = if (isPhoneLandscape) 36.dp else 44.dp
+                        )
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.align(Alignment.Center),
+                    horizontalArrangement = Arrangement.spacedBy(if (isPhoneLandscape) 14.dp else 22.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (channel.contentType != StreamContentType.LIVE_TV) {
+                        FocusableCircleButton(
+                            onClick = { seekVodByOffset(-15_000L) },
+                            icon = Icons.Default.FastRewind,
+                            tint = Color.White,
+                            contentDescription = "-15s",
+                            sizeDp = if (isPhoneLandscape) 38.dp else 48.dp
+                        )
+                    } else if (siblingChannels.size > 1) {
+                        FocusableCircleButton(
+                            onClick = { switchRelativeChannel(-1) },
+                            icon = Icons.Default.KeyboardArrowRight,
+                            tint = Color.White,
+                            contentDescription = "السابقة",
+                            sizeDp = if (isPhoneLandscape) 38.dp else 48.dp
+                        )
+                    }
+
+                    var centerPlayFocused by remember { mutableStateOf(false) }
+                    IconButton(
+                        onClick = {
+                            if (useVlcEngine) {
+                                if (vlcController.isPlaying()) {
+                                    vlcController.pause()
+                                    if (channel.contentType != StreamContentType.LIVE_TV) {
+                                        onSaveVodProgress(channel, vlcController.getTimeMs(), vodDurationMs)
+                                    }
+                                } else {
+                                    vlcController.play()
+                                }
+                            } else {
+                                if (player.isPlaying) {
+                                    player.pause()
+                                    if (channel.contentType != StreamContentType.LIVE_TV) {
+                                        onSaveVodProgress(channel, player.currentPosition.coerceAtLeast(0L), vodDurationMs)
+                                    }
+                                } else {
+                                    if (channel.contentType == StreamContentType.LIVE_TV && player.playbackState == Player.STATE_IDLE) {
+                                        player.prepare()
+                                    }
+                                    player.play()
+                                }
+                            }
+                        },
+                        modifier = Modifier
+                            .focusRequester(centerPlayFocusRequester)
+                            .size(if (isPhoneLandscape) 56.dp else 68.dp)
+                            .scale(if (centerPlayFocused) 1.14f else 1.0f)
+                            .onFocusChanged { centerPlayFocused = it.isFocused }
+                            .focusable()
+                            .background(if (centerPlayFocused) Color.White else BeinPrimaryPurple, CircleShape)
+                            .border(3.dp, if (centerPlayFocused) BeinFocusGlow else Color.White, CircleShape)
+                    ) {
+                        Icon(
+                            imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                            contentDescription = "تشغيل/إيقاف",
+                            tint = if (centerPlayFocused) Color.Black else Color.White,
+                            modifier = Modifier.size(if (isPhoneLandscape) 28.dp else 36.dp)
+                        )
+                    }
+
+                    if (channel.contentType != StreamContentType.LIVE_TV) {
+                        FocusableCircleButton(
+                            onClick = { seekVodByOffset(15_000L) },
+                            icon = Icons.Default.FastForward,
+                            tint = Color.White,
+                            contentDescription = "+15s",
+                            sizeDp = if (isPhoneLandscape) 42.dp else 52.dp
+                        )
+                    } else if (siblingChannels.size > 1) {
+                        FocusableCircleButton(
+                            onClick = { switchRelativeChannel(1) },
+                            icon = Icons.Default.KeyboardArrowLeft,
+                            tint = Color.White,
+                            contentDescription = "التالية",
+                            sizeDp = if (isPhoneLandscape) 42.dp else 52.dp
+                        )
+                    }
+                }
+
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .align(Alignment.BottomCenter)
+                        .background(
+                            Brush.verticalGradient(
+                                colors = listOf(Color.Transparent, Color(0xEB08080A), Color(0xFA08080A))
+                            )
+                        )
+                        .padding(
+                            horizontal = if (isPhoneLandscape) 12.dp else 20.dp,
+                            vertical = if (isPhoneLandscape) 8.dp else 14.dp
+                        ),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    // Bottom Control Bar: Interactive Progress & Seek Bar for Movies/Series OR Live TV Quick Navigation Bar
+                    if (channel.contentType != StreamContentType.LIVE_TV) {
+                        val progressFrac = if (vodDurationMs > 0L) {
+                            (vodPositionMs.toFloat() / vodDurationMs.toFloat()).coerceIn(0f, 1f)
+                        } else 0f
+                        val remainingMs = (vodDurationMs - vodPositionMs).coerceAtLeast(0L)
+                        var seekBarFocused by remember { mutableStateOf(false) }
+
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(Color(0xE6121216))
+                                .border(
+                                    width = if (seekBarFocused) 2.5.dp else 1.2.dp,
+                                    color = if (seekBarFocused) Color.White else BeinHighlightPurple,
+                                    shape = RoundedCornerShape(14.dp)
+                                )
+                                .onFocusChanged { seekBarFocused = it.isFocused }
+                                .onKeyEvent { ev ->
+                                    if (ev.nativeKeyEvent.action == KeyEvent.ACTION_DOWN) {
+                                        when (ev.nativeKeyEvent.keyCode) {
+                                            KeyEvent.KEYCODE_DPAD_LEFT -> {
+                                                seekVodByOffset(-15_000L)
+                                                true
+                                            }
+                                            KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                                                seekVodByOffset(15_000L)
+                                                true
+                                            }
+                                            KeyEvent.KEYCODE_DPAD_CENTER,
+                                            KeyEvent.KEYCODE_ENTER -> {
+                                                if (useVlcEngine) {
+                                                    if (vlcController.isPlaying()) vlcController.pause() else vlcController.play()
+                                                } else {
+                                                    if (player.isPlaying) player.pause() else player.play()
+                                                }
+                                                true
+                                            }
+                                            else -> false
+                                        }
+                                    } else false
+                                }
+                                .focusable()
+                                .padding(horizontal = 14.dp, vertical = 9.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "⏱ ${VodWatchProgress.formatDurationMs(vodPositionMs)} / ${VodWatchProgress.formatDurationMs(vodDurationMs)} (${(progressFrac * 100).toInt()}%)",
+                                    color = Color.White,
+                                    fontSize = if (isPhoneLandscape) 12.sp else 14.sp,
+                                    fontWeight = FontWeight.ExtraBold
+                                )
+                                Text(
+                                    text = if (vodDurationMs > 0L) {
+                                        "المتبقي: -${VodWatchProgress.formatDurationMs(remainingMs)} • اسحب الشريط باللمس أو ◀/▶ بالريموت"
+                                    } else {
+                                        "اسحب الشريط باللمس أو اضغط ◀/▶ للتقديم والتأخير"
+                                    },
+                                    color = Color(0xFFE2E8F0),
+                                    fontSize = if (isPhoneLandscape) 11.sp else 13.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+
+                            // Conflict-Free Touch + D-Pad Progress Bar (No Google TV Slider Focus Trap!)
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(22.dp)
+                                    .pointerInput(vodDurationMs) {
+                                        detectTapGestures { offset ->
+                                            if (vodDurationMs > 0L && size.width > 0) {
+                                                val frac = (offset.x / size.width.toFloat()).coerceIn(0f, 1f)
+                                                seekVodTo((frac * vodDurationMs).toLong())
+                                            }
+                                        }
+                                    }
+                                    .pointerInput(vodDurationMs) {
+                                        detectHorizontalDragGestures { change, _ ->
+                                            change.consume()
+                                            if (vodDurationMs > 0L && size.width > 0) {
+                                                val frac = (change.position.x / size.width.toFloat()).coerceIn(0f, 1f)
+                                                seekVodTo((frac * vodDurationMs).toLong())
+                                            }
+                                        }
+                                    },
+                                contentAlignment = Alignment.CenterStart
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(if (seekBarFocused) 10.dp else 7.dp)
+                                        .clip(RoundedCornerShape(99.dp))
+                                        .background(Color(0xFF2C2C36))
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth(progressFrac)
+                                            .fillMaxHeight()
+                                            .clip(RoundedCornerShape(99.dp))
+                                            .background(
+                                                Brush.horizontalGradient(
+                                                    colors = listOf(Color(0xFFE50914), Color(0xFFFF3B30))
+                                                )
+                                            )
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        // Live TV Bottom Info & Quick Channel Switch Bar
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(Color(0xE6121216))
+                                .border(1.2.dp, BeinBorder, RoundedCornerShape(14.dp))
+                                .padding(horizontal = 14.dp, vertical = 8.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .background(Color(0xFFE50914), RoundedCornerShape(6.dp))
+                                        .padding(horizontal = 8.dp, vertical = 3.dp)
+                                ) {
+                                    Text(
+                                        text = "● LIVE",
+                                        color = Color.White,
+                                        fontSize = if (isPhoneLandscape) 11.sp else 12.sp,
+                                        fontWeight = FontWeight.ExtraBold
+                                    )
+                                }
+                                Text(
+                                    text = "${channel.name} • ${channel.group}",
+                                    color = Color.White,
+                                    fontSize = if (isPhoneLandscape) 13.sp else 15.sp,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            if (siblingChannels.size > 1) {
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    FocusableActionPill(
+                                        text = "⏮ السابقة",
+                                        isPrimary = false,
+                                        compact = isPhoneLandscape,
+                                        onClick = { switchRelativeChannel(-1) }
+                                    )
+                                    FocusableActionPill(
+                                        text = "⏭ التالية",
+                                        isPrimary = false,
+                                        compact = isPhoneLandscape,
+                                        onClick = { switchRelativeChannel(1) }
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    // Horizontally Scrollable Bottom Control Toolbar (Easy Touch on Phone + D-Pad on TV)
+                    LazyRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (channel.contentType == StreamContentType.LIVE_TV) {
+                            item {
+                                FocusableActionPill(
+                                    text = "📂 ${AppStrings.tr(lang, "القنوات والباقات", "Chaînes & Bouquets", "Channels & Bouquets")}",
+                                    isPrimary = true,
+                                    compact = isPhoneLandscape,
+                                    onClick = {
+                                        showControls = false
+                                        drawerSelectedBouquet = channel.group
+                                        showQuickDrawer = true
+                                    }
+                                )
+                            }
+                            item {
+                                FocusableActionPill(
+                                    text = if (isPlaying) {
+                                        "⏸ ${AppStrings.tr(lang, "إيقاف البث", "Pause Direct", "Pause Live")}"
+                                    } else {
+                                        "▶ ${AppStrings.tr(lang, "تشغيل البث", "Lecture Direct", "Play Live")}"
+                                    },
+                                    isPrimary = false,
+                                    compact = isPhoneLandscape,
+                                    onClick = {
+                                        if (useVlcEngine) {
+                                            if (vlcController.isPlaying()) vlcController.pause() else vlcController.play()
+                                        } else {
+                                            if (player.isPlaying) player.pause() else player.play()
+                                        }
+                                    }
+                                )
+                            }
+                        } else {
+                            item {
+                                FocusableActionPill(
+                                    text = if (isPlaying) {
+                                        "⏸ ${AppStrings.tr(lang, "إيقاف مؤقت", "Pause", "Pause")}"
+                                    } else {
+                                        "▶ ${AppStrings.tr(lang, "استئناف التشغيل", "Reprendre", "Resume")}"
+                                    },
+                                    isPrimary = true,
+                                    compact = isPhoneLandscape,
+                                    onClick = {
+                                        if (player.isPlaying) {
+                                            player.pause()
+                                            onSaveVodProgress(channel, player.currentPosition.coerceAtLeast(0L), vodDurationMs)
+                                        } else {
+                                            player.play()
+                                        }
+                                    }
+                                )
+                            }
+                            item {
+                                FocusableActionPill(
+                                    text = "⏪ -15s",
+                                    isPrimary = false,
+                                    compact = isPhoneLandscape,
+                                    onClick = { seekVodByOffset(-15_000L) }
+                                )
+                            }
+                            item {
+                                FocusableActionPill(
+                                    text = "⏩ +15s",
+                                    isPrimary = false,
+                                    compact = isPhoneLandscape,
+                                    onClick = { seekVodByOffset(15_000L) }
+                                )
+                            }
+                            item {
+                                FocusableActionPill(
+                                    text = "⏮ ${AppStrings.tr(lang, "من البداية", "Depuis le début", "Restart")}",
+                                    isPrimary = false,
+                                    compact = isPhoneLandscape,
+                                    onClick = {
+                                        seekVodTo(0L)
+                                        if (useVlcEngine) vlcController.play() else player.play()
+                                    }
+                                )
+                            }
+                            item {
+                                FocusableActionPill(
+                                    text = "⏹ ${AppStrings.tr(lang, "حفظ وخروج", "Sauvegarder & Quitter", "Save & Exit")}",
+                                    isPrimary = false,
+                                    compact = isPhoneLandscape,
+                                    onClick = {
+                                        val pos = currentVodPositionMs()
+                                        val dur = if (useVlcEngine) {
+                                            vlcController.getLengthMs().let { if (it <= 0L) vodDurationMs else it }
+                                        } else {
+                                            player.duration.let { if (it == C.TIME_UNSET || it < 0L) vodDurationMs else it }
+                                        }
+                                        if (pos >= 3_000L) {
+                                            onSaveVodProgress(channel, pos, dur)
+                                        }
+                                        if (useVlcEngine) vlcController.pause() else player.pause()
+                                        onBack()
+                                    }
+                                )
+                            }
+                        }
+
+                        item {
+                            FocusableActionPill(
+                                text = "⚙️ ${AppStrings.tr(lang, "الجودة والصوت والسرعة", "Qualité, Audio & Vitesse", "Quality, Audio & Speed")}",
+                                isPrimary = false,
+                                compact = isPhoneLandscape,
+                                onClick = { showTracksDialog = true }
+                            )
+                        }
+                        item {
+                            FocusableActionPill(
+                                text = "🔄 الصيغة (${candidateIndex + 1}/${formatCandidateUrls.size})",
+                                isPrimary = false,
+                                compact = isPhoneLandscape,
+                                onClick = {
+                                    formatAttemptMode = 0
+                                    retryCount = 0
+                                    candidateIndex = (candidateIndex + 1) % formatCandidateUrls.size.coerceAtLeast(1)
+                                }
+                            )
+                        }
+                        item {
+                            FocusableActionPill(
+                                text = "🎬 المشغل: ${activeEngine.badgeLabel}",
+                                isPrimary = activeEngine == InternalPlayerEngine.VLC_PLAYER,
+                                compact = isPhoneLandscape,
+                                onClick = {
+                                    val engines = InternalPlayerEngine.values()
+                                    val nextEngine = engines[(activeEngine.ordinal + 1) % engines.size]
+                                    activeEngine = nextEngine
+                                    vlcFallbackToExo = false
+                                    onUpdatePreferences(preferences.copy(playerEngine = nextEngine))
+                                }
+                            )
+                        }
+                        item {
+                            FocusableActionPill(
+                                text = "📐 ${resizeMode.titleAr}",
+                                isPrimary = false,
+                                compact = isPhoneLandscape,
+                                onClick = {
+                                    val modes = VideoResizeMode.values()
+                                    resizeMode = modes[(resizeMode.ordinal + 1) % modes.size]
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        if (showQuickDrawer) {
+            val bouquetListState = rememberLazyListState()
+            val channelListState = rememberLazyListState()
+
+            val activeBouquetIdx = remember(allBouquets, drawerSelectedBouquet) {
+                allBouquets.indexOfFirst { it.first == drawerSelectedBouquet }.coerceAtLeast(0)
+            }
+            val activeChannelIdx = remember(drawerChannels, channel.stableKey) {
+                drawerChannels.indexOfFirst { it.stableKey == channel.stableKey }.coerceAtLeast(0)
+            }
+
+            // Windowed Lazy Paging inside Quick Drawer (prevents any UI lag on huge bouquets)
+            var drawerVisibleLimit by remember(drawerSelectedBouquet, drawerChannels.size) {
+                mutableStateOf((activeChannelIdx + 140).coerceAtLeast(160).coerceAtMost(drawerChannels.size.coerceAtLeast(1)))
+            }
+            val windowedDrawerChannels = remember(drawerChannels, drawerVisibleLimit) {
+                if (drawerChannels.size <= drawerVisibleLimit) drawerChannels
+                else drawerChannels.subList(0, drawerVisibleLimit)
+            }
+            val favKeySet = remember(favorites) { favorites.map { it.stableKey }.toHashSet() }
+
+            val shouldLoadMoreDrawer by remember {
+                derivedStateOf {
+                    val lastVisible = channelListState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+                    lastVisible >= windowedDrawerChannels.size - 24 && windowedDrawerChannels.size < drawerChannels.size
+                }
+            }
+            LaunchedEffect(shouldLoadMoreDrawer) {
+                if (shouldLoadMoreDrawer) {
+                    drawerVisibleLimit = (drawerVisibleLimit + 160).coerceAtMost(drawerChannels.size)
+                }
+            }
+
+            LaunchedEffect(showQuickDrawer, channel.stableKey) {
+                if (showQuickDrawer) {
+                    drawerSelectedBouquet = channel.group
+                    delay(45L)
+                    runCatching { bouquetListState.scrollToItem(activeBouquetIdx) }
+                    runCatching { channelListState.scrollToItem((activeChannelIdx - 1).coerceAtLeast(0)) }
+                    delay(65L)
+                    runCatching { activeChannelFocusRequester.requestFocus() }
+                        .onFailure { runCatching { firstChannelInBouquetFocusRequester.requestFocus() } }
+                        .onFailure { runCatching { activeBouquetFocusRequester.requestFocus() } }
+                }
+            }
+
+            LaunchedEffect(focusFirstChannelTrigger) {
+                if (focusFirstChannelTrigger > 0) {
+                    runCatching { channelListState.scrollToItem(0) }
+                    delay(60L)
+                    runCatching { firstChannelInBouquetFocusRequester.requestFocus() }
+                        .onFailure { runCatching { activeChannelFocusRequester.requestFocus() } }
+                }
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth(if (isPhoneLandscape) 0.86f else 0.68f)
+                    .widthIn(min = 380.dp, max = 660.dp)
+                    .fillMaxHeight(if (isPhoneLandscape) 0.90f else 0.86f)
+                    .align(Alignment.CenterStart)
+                    .padding(start = if (isPhoneLandscape) 8.dp else 16.dp)
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(Color(0xF70A0A0E))
+                    .border(2.dp, BeinHighlightPurple, RoundedCornerShape(18.dp))
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null
+                    ) {}
+                    .padding(if (isPhoneLandscape) 8.dp else 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .weight(0.42f)
+                        .fillMaxHeight()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Color(0xFF101015))
+                        .padding(8.dp)
+                ) {
+                    Text(
+                        text = "📂 ${AppStrings.tr(lang, "الباقات", "Bouquets", "Bouquets")} (${allBouquets.size})",
+                        color = Color.White,
+                        fontSize = if (isPhoneLandscape) 11.sp else 14.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)
+                    )
+                    LazyColumn(
+                        state = bouquetListState,
+                        verticalArrangement = Arrangement.spacedBy(5.dp),
+                        modifier = Modifier.fillMaxSize()
+                    ) {
+                        itemsIndexed(allBouquets, key = { idx, pair -> "${idx}_${pair.first}" }) { idx, (bName, bList) ->
+                            val selected = drawerSelectedBouquet == bName
+                            var bFocused by remember { mutableStateOf(false) }
+                            val bModifier = if (idx == activeBouquetIdx) {
+                                Modifier.focusRequester(activeBouquetFocusRequester)
+                            } else {
+                                Modifier
+                            }
+                            Row(
+                                modifier = bModifier
+                                    .fillMaxWidth()
+                                    .wrapContentHeight()
+                                    .scale(if (bFocused) 1.03f else 1.0f)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(
+                                        when {
+                                            bFocused -> Color.White
+                                            selected -> BeinPrimaryPurple
+                                            else -> Color(0xFF16161D)
+                                        }
+                                    )
+                                    .border(
+                                        width = if (bFocused) 2.5.dp else if (selected) 1.5.dp else 0.dp,
+                                        color = if (bFocused) BeinFocusGlow else if (selected) Color.White else Color.Transparent,
+                                        shape = RoundedCornerShape(10.dp)
+                                    )
+                                    .onFocusChanged { bFocused = it.isFocused }
+                                    .onKeyEvent { ev ->
+                                        if (ev.nativeKeyEvent.action == KeyEvent.ACTION_DOWN) {
+                                            when (ev.nativeKeyEvent.keyCode) {
+                                                KeyEvent.KEYCODE_DPAD_CENTER,
+                                                KeyEvent.KEYCODE_ENTER,
+                                                KeyEvent.KEYCODE_DPAD_LEFT -> {
+                                                    drawerSelectedBouquet = bName
+                                                    focusFirstChannelTrigger += 1
+                                                    true
+                                                }
+                                                else -> false
+                                            }
+                                        } else false
+                                    }
+                                    .focusable()
+                                    .clickable {
+                                        drawerSelectedBouquet = bName
+                                        focusFirstChannelTrigger += 1
+                                    }
+                                    .padding(horizontal = 10.dp, vertical = if (isPhoneLandscape) 7.dp else 9.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = bName,
+                                    color = if (bFocused) Color.Black else Color.White,
+                                    fontSize = if (isPhoneLandscape) 11.sp else 13.sp,
+                                    fontWeight = if (bFocused || selected) FontWeight.ExtraBold else FontWeight.SemiBold,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Visible,
+                                    lineHeight = 16.sp,
+                                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Spacer(Modifier.width(6.dp))
+                                Text(
+                                    text = "${bList.size}",
+                                    color = if (bFocused) BeinPrimaryPurple else Color(0xFFE2E8F0),
+                                    fontSize = if (isPhoneLandscape) 10.sp else 11.sp,
+                                    fontWeight = FontWeight.ExtraBold
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Column(
+                    modifier = Modifier
+                        .weight(0.58f)
+                        .fillMaxHeight()
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "$drawerSelectedBouquet (${drawerChannels.size})",
+                            color = Color.White,
+                            fontSize = if (isPhoneLandscape) 12.sp else 14.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            maxLines = 2,
+                            lineHeight = 17.sp,
+                            modifier = Modifier.weight(1f)
+                        )
+                        IconButton(
+                            onClick = { showQuickDrawer = false },
+                            modifier = Modifier.size(26.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.Close,
+                                contentDescription = "إغلاق",
+                                tint = Color.White,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(6.dp))
+
+                    if (windowedDrawerChannels.isEmpty()) {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text(
+                                text = AppStrings.tr(
+                                    lang,
+                                    "لا توجد قنوات في هذه الباقة حالياً",
+                                    "Aucune chaîne dans ce bouquet",
+                                    "No channels in this bouquet"
+                                ),
+                                color = Color.LightGray,
+                                fontSize = 12.sp
+                            )
+                        }
+                    } else {
+                        LazyColumn(
+                            state = channelListState,
+                            verticalArrangement = Arrangement.spacedBy(5.dp),
+                            modifier = Modifier.fillMaxSize()
+                        ) {
+                            itemsIndexed(windowedDrawerChannels, key = { idx, it -> "${idx}_${it.stableKey}" }) { idx, item ->
+                                val active = item.stableKey == channel.stableKey
+                                val isFavItem = favKeySet.contains(item.stableKey)
+                                var rowFocused by remember { mutableStateOf(false) }
+                                val chModifier = when {
+                                    idx == activeChannelIdx ->
+                                        Modifier.focusRequester(activeChannelFocusRequester)
+                                    idx == 0 ->
+                                        Modifier.focusRequester(firstChannelInBouquetFocusRequester)
+                                    else -> Modifier
+                                }
+                                Row(
+                                    modifier = chModifier
+                                        .fillMaxWidth()
+                                        .wrapContentHeight()
+                                        .scale(if (rowFocused) 1.02f else 1.0f)
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .background(
+                                            when {
+                                                rowFocused -> Color.White
+                                                active -> BeinPrimaryPurple
+                                                else -> Color(0xFF16161D)
+                                            }
+                                        )
+                                        .border(
+                                            width = if (rowFocused) 2.5.dp else if (active) 1.5.dp else 0.dp,
+                                            color = if (rowFocused) BeinFocusGlow else if (active) Color.White else Color.Transparent,
+                                            shape = RoundedCornerShape(10.dp)
+                                        )
+                                        .onFocusChanged { rowFocused = it.isFocused }
+                                        .onKeyEvent { ev ->
+                                            if (ev.nativeKeyEvent.action == KeyEvent.ACTION_DOWN) {
+                                                when (ev.nativeKeyEvent.keyCode) {
+                                                    KeyEvent.KEYCODE_DPAD_CENTER,
+                                                    KeyEvent.KEYCODE_ENTER -> {
+                                                        showControls = false
+                                                        showQuickDrawer = false
+                                                        onSelectChannel(item)
+                                                        true
+                                                    }
+                                                    KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                                                        runCatching { activeBouquetFocusRequester.requestFocus() }
+                                                        true
+                                                    }
+                                                    else -> false
+                                                }
+                                            } else false
+                                        }
+                                        .focusable()
+                                        .clickable {
+                                            showControls = false
+                                            showQuickDrawer = false
+                                            onSelectChannel(item)
+                                        }
+                                        .padding(horizontal = 10.dp, vertical = if (isPhoneLandscape) 6.dp else 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    ChannelAvatar(
+                                        name = item.name,
+                                        logoUrl = item.logo,
+                                        modifier = Modifier.size(if (isPhoneLandscape) 34.dp else 44.dp),
+                                        cornerRadius = 9.dp,
+                                        innerPadding = 2.dp
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                    Text(
+                                        text = item.name,
+                                        color = if (rowFocused) Color.Black else Color.White,
+                                        fontSize = if (isPhoneLandscape) 11.sp else 13.sp,
+                                        fontWeight = if (active || rowFocused) FontWeight.ExtraBold else FontWeight.Medium,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Visible,
+                                        lineHeight = 16.sp,
+                                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    if (isFavItem) {
+                                        Spacer(Modifier.width(4.dp))
+                                        Text(
+                                            text = "★",
+                                            color = if (rowFocused) BeinPrimaryPurple else Color(0xFFFF4D6D),
+                                            fontSize = 13.sp,
+                                            fontWeight = FontWeight.ExtraBold
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (showTracksDialog) {
+            InteractiveTrackAndSpeedModal(
+                player = player,
+                tracks = currentTracksSnapshot,
+                currentSpeed = playbackSpeed,
+                onSelectSpeed = { playbackSpeed = it },
+                compact = isPhoneLandscape,
+                onDismiss = { showTracksDialog = false }
+            )
+        }
+
+        val currentDiag = playerDiagnosticAlert
+        if (currentDiag != null) {
+            Dialog(onDismissRequest = { playerDiagnosticAlert = null }) {
+                Column(
+                    modifier = Modifier
+                        .widthIn(min = 310.dp, max = 540.dp)
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(Color(0xFF101015))
+                        .border(
+                            2.dp,
+                            if (currentDiag.type == DiagnosticAlertType.ACCOUNT_EXPIRED) CrimsonAlert else BeinHighlightPurple,
+                            RoundedCornerShape(20.dp)
+                        )
+                        .padding(if (isPhoneLandscape) 14.dp else 22.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text(
+                        text = currentDiag.title,
+                        color = Color.White,
+                        fontSize = if (isPhoneLandscape) 14.sp else 17.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                    )
+                    Text(
+                        text = currentDiag.message,
+                        color = Color(0xFFE2E8F0),
+                        fontSize = if (isPhoneLandscape) 11.sp else 13.sp,
+                        lineHeight = 20.sp,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(BeinPrimaryPurple)
+                                .border(1.5.dp, Color.White, RoundedCornerShape(12.dp))
+                                .clickable {
+                                    playerDiagnosticAlert = null
+                                    retryCount = 0
+                                    candidateIndex = 0
+                                    formatAttemptMode = 0
+                                    errorMessage = null
+                                    player.prepare()
+                                    player.play()
+                                }
+                                .padding(vertical = 10.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "🔄 إعادة المحاولة الآن",
+                                color = Color.White,
+                                fontWeight = FontWeight.ExtraBold,
+                                fontSize = 12.sp
+                            )
+                        }
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(Color(0xFF1C1C24))
+                                .border(1.dp, BeinHighlightPurple, RoundedCornerShape(12.dp))
+                                .clickable {
+                                    playerDiagnosticAlert = null
+                                    onBack()
+                                }
+                                .padding(vertical = 10.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "العودة للقائمة",
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FocusableCircleButton(
+    onClick: () -> Unit,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    contentDescription: String,
+    tint: Color = Color.White,
+    sizeDp: androidx.compose.ui.unit.Dp = 44.dp
+) {
+    var focused by remember { mutableStateOf(false) }
+    IconButton(
+        onClick = { SafeClickGuard.runThrottled("PLAYER_CIRCLE_BTN", 200L) { onClick() } },
+        modifier = Modifier
+            .size(sizeDp)
+            .scale(if (focused) 1.14f else 1.0f)
+            .onFocusChanged { focused = it.isFocused }
+            .focusable()
+            .background(if (focused) Color.White else Color(0xE6181820), CircleShape)
+            .border(
+                width = if (focused) 2.8.dp else 1.5.dp,
+                color = if (focused) BeinFocusGlow else BeinHighlightPurple.copy(alpha = 0.7f),
+                shape = CircleShape
+            )
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = contentDescription,
+            tint = if (focused) Color.Black else tint,
+            modifier = Modifier.size(sizeDp * 0.52f)
+        )
+    }
+}
+
+@Composable
+private fun FocusableActionPill(
+    text: String,
+    isPrimary: Boolean,
+    compact: Boolean = false,
+    onClick: () -> Unit
+) {
+    var focused by remember { mutableStateOf(false) }
+    Box(
+        modifier = Modifier
+            .scale(if (focused) 1.08f else 1.0f)
+            .clip(RoundedCornerShape(10.dp))
+            .onFocusChanged { focused = it.isFocused }
+            .onKeyEvent { ev ->
+                if (ev.nativeKeyEvent.action == KeyEvent.ACTION_DOWN &&
+                    ev.nativeKeyEvent.repeatCount == 0 &&
+                    (ev.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_DPAD_CENTER ||
+                        ev.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_ENTER)
+                ) {
+                    SafeClickGuard.runThrottled("PLAYER_UI_CLICK", 200L) { onClick() }
+                    true
+                } else false
+            }
+            .focusable()
+            .background(
+                when {
+                    focused -> Color.White
+                    isPrimary -> BeinPrimaryPurple
+                    else -> Color(0xE6181820)
+                }
+            )
+            .border(
+                width = if (focused) 2.8.dp else 1.2.dp,
+                color = if (focused) BeinFocusGlow else BeinHighlightPurple.copy(alpha = 0.75f),
+                shape = RoundedCornerShape(10.dp)
+            )
+            .clickable { onClick() }
+            .padding(
+                horizontal = if (compact) 13.dp else 16.dp,
+                vertical = if (compact) 8.dp else 10.dp
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = text,
+            color = if (focused) Color.Black else Color.White,
+            fontSize = if (compact) 12.sp else 14.sp,
+            fontWeight = FontWeight.ExtraBold
+        )
+    }
+}
+
+@OptIn(UnstableApi::class)
+@Composable
+private fun InteractiveTrackAndSpeedModal(
+    player: ExoPlayer,
+    tracks: Tracks,
+    currentSpeed: PlaybackSpeedOption,
+    onSelectSpeed: (PlaybackSpeedOption) -> Unit,
+    compact: Boolean,
+    onDismiss: () -> Unit
+) {
+    var selectedSection by remember { mutableStateOf(0) }
+    val firstItemFocus = remember { FocusRequester() }
+
+    val videoOptions = remember(tracks) {
+        val list = mutableListOf<TrackOption>()
+        tracks.groups.forEachIndexed { gIndex, group ->
+            if (group.type == C.TRACK_TYPE_VIDEO) {
+                for (tIndex in 0 until group.length) {
+                    val fmt = group.getTrackFormat(tIndex)
+                    if (fmt.height > 0) {
+                        val badge = when {
+                            fmt.height >= 2160 -> "4K UHD"
+                            fmt.height >= 1080 -> "Full HD 1080p"
+                            fmt.height >= 720 -> "HD 720p"
+                            else -> "SD ${fmt.height}p"
+                        }
+                        val br = if (fmt.bitrate > 0) "${fmt.bitrate / 1000} kbps" else "Adaptive"
+                        val fps = if (fmt.frameRate > 0) " • ${fmt.frameRate.toInt()}fps" else ""
+                        list.add(
+                            TrackOption(
+                                title = "$badge (${fmt.width}×${fmt.height})",
+                                subtitle = "معدل البث: $br$fps",
+                                groupIndex = gIndex,
+                                trackIndex = tIndex,
+                                isSelected = group.isTrackSelected(tIndex)
+                            )
+                        )
+                    }
+                }
+            }
+        }
+        list.sortedByDescending { it.title }
+    }
+
+    val audioOptions = remember(tracks) {
+        val list = mutableListOf<TrackOption>()
+        var commentatorNum = 1
+        tracks.groups.forEachIndexed { gIndex, group ->
+            if (group.type == C.TRACK_TYPE_AUDIO) {
+                for (tIndex in 0 until group.length) {
+                    val fmt = group.getTrackFormat(tIndex)
+                    val rawLabel = fmt.label?.takeIf { it.isNotBlank() }
+                    val rawLang = fmt.language?.takeIf { it.isNotBlank() && it != "und" }
+                    val title = when {
+                        rawLabel != null && rawLang != null -> "معلق / صوت $commentatorNum: $rawLabel ($rawLang)"
+                        rawLabel != null -> "معلق / صوت $commentatorNum: $rawLabel"
+                        rawLang != null -> "معلق / مسار صوتي $commentatorNum ($rawLang)"
+                        else -> "المعلق الصوتي / المسار رقم $commentatorNum"
+                    }
+                    val channelsDesc = if (fmt.channelCount >= 6) "صوت محيطي 5.1" else "ستيريو واضح"
+                    val br = if (fmt.bitrate > 0) " • ${fmt.bitrate / 1000} kbps" else ""
+                    list.add(
+                        TrackOption(
+                            title = title,
+                            subtitle = "$channelsDesc$br",
+                            groupIndex = gIndex,
+                            trackIndex = tIndex,
+                            isSelected = group.isTrackSelected(tIndex)
+                        )
+                    )
+                    commentatorNum++
+                }
+            }
+        }
+        list
+    }
+
+    val hasVideoOverride = remember(player.trackSelectionParameters) {
+        player.trackSelectionParameters.overrides.keys.any { it.type == C.TRACK_TYPE_VIDEO }
+    }
+
+    LaunchedEffect(Unit) {
+        delay(80L)
+        runCatching { firstItemFocus.requestFocus() }
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color(0xB3000000))
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null
+                ) { onDismiss() },
+            contentAlignment = Alignment.Center
+        ) {
+            Column(
+                modifier = Modifier
+                    .widthIn(min = 320.dp, max = if (compact) 540.dp else 640.dp)
+                    .fillMaxWidth(0.90f)
+                    .fillMaxHeight(if (compact) 0.88f else 0.80f)
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(Color(0xFF101015))
+                    .border(2.dp, BeinHighlightPurple, RoundedCornerShape(18.dp))
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null
+                    ) {}
+                    .padding(if (compact) 12.dp else 18.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text(
+                            text = "إعدادات الجودة والمعلق الصوتي وسرعة العرض ⚙️",
+                            color = Color.White,
+                            fontSize = if (compact) 13.sp else 16.sp,
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                        Text(
+                            text = "تنقل بأسهم الريموت (▲▼◄►) واضغط (OK) للاختيار الفوري",
+                            color = Color.LightGray,
+                            fontSize = if (compact) 9.sp else 11.sp
+                        )
+                    }
+                    FocusableCircleButton(
+                        onClick = onDismiss,
+                        icon = Icons.Default.Close,
+                        contentDescription = "إغلاق",
+                        sizeDp = if (compact) 32.dp else 38.dp
+                    )
+                }
+
+                Spacer(Modifier.height(if (compact) 6.dp else 10.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    InteractiveModalTabButton(
+                        title = "📺 الجودة (${videoOptions.size + 1})",
+                        selected = selectedSection == 0,
+                        compact = compact,
+                        modifier = Modifier
+                            .weight(1f)
+                            .focusRequester(firstItemFocus),
+                        onClick = { selectedSection = 0 }
+                    )
+                    InteractiveModalTabButton(
+                        title = "🎙 المعلق (${audioOptions.size.coerceAtLeast(1)})",
+                        selected = selectedSection == 1,
+                        compact = compact,
+                        modifier = Modifier.weight(1f),
+                        onClick = { selectedSection = 1 }
+                    )
+                    InteractiveModalTabButton(
+                        title = "⚡ السرعة",
+                        selected = selectedSection == 2,
+                        compact = compact,
+                        modifier = Modifier.weight(1f),
+                        onClick = { selectedSection = 2 }
+                    )
+                }
+
+                Spacer(Modifier.height(if (compact) 6.dp else 10.dp))
+
+                LazyColumn(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    when (selectedSection) {
+                        0 -> {
+                            item {
+                                InteractiveTrackCard(
+                                    title = "تلقائي متكيّف (Auto Adaptive HD) — موصى به",
+                                    subtitle = "يختار أعلى جودة مستقرة حسب سرعة الاتصال",
+                                    isSelected = !hasVideoOverride,
+                                    compact = compact,
+                                    onClick = {
+                                        player.trackSelectionParameters = player.trackSelectionParameters
+                                            .buildUpon()
+                                            .clearOverridesOfType(C.TRACK_TYPE_VIDEO)
+                                            .build()
+                                        onDismiss()
+                                    }
+                                )
+                            }
+
+                            itemsIndexed(videoOptions) { _, opt ->
+                                InteractiveTrackCard(
+                                    title = opt.title,
+                                    subtitle = opt.subtitle,
+                                    isSelected = hasVideoOverride && opt.isSelected,
+                                    compact = compact,
+                                    onClick = {
+                                        val group = tracks.groups[opt.groupIndex].mediaTrackGroup
+                                        player.trackSelectionParameters = player.trackSelectionParameters
+                                            .buildUpon()
+                                            .setOverrideForType(
+                                                TrackSelectionOverride(group, opt.trackIndex)
+                                            )
+                                            .build()
+                                        onDismiss()
+                                    }
+                                )
+                            }
+                        }
+                        1 -> {
+                            if (audioOptions.isEmpty()) {
+                                item {
+                                    InteractiveTrackCard(
+                                        title = "المسار الصوتي الافتراضي للمصدر",
+                                        subtitle = "هذه القناة تبث بمسار تعليق صوتي موحّد",
+                                        isSelected = true,
+                                        compact = compact,
+                                        onClick = onDismiss
+                                    )
+                                }
+                            } else {
+                                itemsIndexed(audioOptions) { _, opt ->
+                                    InteractiveTrackCard(
+                                        title = opt.title,
+                                        subtitle = opt.subtitle,
+                                        isSelected = opt.isSelected,
+                                        compact = compact,
+                                        onClick = {
+                                            val group = tracks.groups[opt.groupIndex].mediaTrackGroup
+                                            player.trackSelectionParameters = player.trackSelectionParameters
+                                                .buildUpon()
+                                                .setOverrideForType(
+                                                    TrackSelectionOverride(group, opt.trackIndex)
+                                                )
+                                                .build()
+                                            onDismiss()
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                        else -> {
+                            itemsIndexed(PlaybackSpeedOption.values().toList()) { _, spd ->
+                                InteractiveTrackCard(
+                                    title = "سرعة التشغيل: ${spd.labelAr}",
+                                    subtitle = if (spd == PlaybackSpeedOption.NORMAL) {
+                                        "السرعة المثالية لاستقرار القنوات المباشرة"
+                                    } else {
+                                        "تغيير سرعة عرض الفيديو والصوت"
+                                    },
+                                    isSelected = currentSpeed == spd,
+                                    compact = compact,
+                                    onClick = {
+                                        onSelectSpeed(spd)
+                                        onDismiss()
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun InteractiveModalTabButton(
+    title: String,
+    selected: Boolean,
+    compact: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    var focused by remember { mutableStateOf(false) }
+    Box(
+        modifier = modifier
+            .height(if (compact) 34.dp else 42.dp)
+            .scale(if (focused) 1.05f else 1.0f)
+            .clip(RoundedCornerShape(10.dp))
+            .onFocusChanged { focused = it.isFocused }
+            .onKeyEvent { ev ->
+                if (ev.nativeKeyEvent.action == KeyEvent.ACTION_DOWN &&
+                    ev.nativeKeyEvent.repeatCount == 0 &&
+                    (ev.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_DPAD_CENTER ||
+                        ev.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_ENTER)
+                ) {
+                    SafeClickGuard.runThrottled("PLAYER_UI_CLICK", 200L) { onClick() }
+                    true
+                } else false
+            }
+            .focusable()
+            .background(
+                when {
+                    focused -> Color.White
+                    selected -> BeinPrimaryPurple
+                    else -> Color(0xFF16161D)
+                }
+            )
+            .border(
+                width = if (focused) 2.5.dp else 1.dp,
+                color = if (focused) BeinFocusGlow else if (selected) Color.White else Color(0xFF2C2C38),
+                shape = RoundedCornerShape(10.dp)
+            )
+            .clickable { onClick() },
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = title,
+            color = if (focused) Color.Black else Color.White,
+            fontWeight = FontWeight.ExtraBold,
+            fontSize = if (compact) 9.sp else 11.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+@Composable
+private fun InteractiveTrackCard(
+    title: String,
+    subtitle: String,
+    isSelected: Boolean,
+    compact: Boolean,
+    onClick: () -> Unit
+) {
+    var focused by remember { mutableStateOf(false) }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .scale(if (focused) 1.02f else 1.0f)
+            .clip(RoundedCornerShape(12.dp))
+            .onFocusChanged { focused = it.isFocused }
+            .onKeyEvent { ev ->
+                if (ev.nativeKeyEvent.action == KeyEvent.ACTION_DOWN &&
+                    ev.nativeKeyEvent.repeatCount == 0 &&
+                    (ev.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_DPAD_CENTER ||
+                        ev.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_ENTER)
+                ) {
+                    SafeClickGuard.runThrottled("PLAYER_UI_CLICK", 200L) { onClick() }
+                    true
+                } else false
+            }
+            .focusable()
+            .background(
+                when {
+                    focused -> Color.White
+                    isSelected -> BeinPrimaryPurple.copy(alpha = 0.55f)
+                    else -> Color(0xFF16161D)
+                }
+            )
+            .border(
+                width = if (focused) 2.8.dp else if (isSelected) 1.5.dp else 1.dp,
+                color = when {
+                    focused -> BeinFocusGlow
+                    isSelected -> Color.White
+                    else -> Color(0xFF2C2C38)
+                },
+                shape = RoundedCornerShape(12.dp)
+            )
+            .clickable { onClick() }
+            .padding(
+                horizontal = if (compact) 12.dp else 16.dp,
+                vertical = if (compact) 8.dp else 11.dp
+            ),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                color = if (focused) Color.Black else Color.White,
+                fontWeight = FontWeight.ExtraBold,
+                fontSize = if (compact) 11.sp else 13.sp
+            )
+            Text(
+                text = subtitle,
+                color = if (focused) Color.DarkGray else Color.LightGray,
+                fontSize = if (compact) 9.sp else 11.sp
+            )
+        }
+
+        Box(
+            modifier = Modifier
+                .size(if (compact) 20.dp else 24.dp)
+                .clip(CircleShape)
+                .background(if (isSelected) EmeraldLive else Color(0xFF24242E))
+                .border(1.dp, if (focused) Color.Black else Color.Transparent, CircleShape),
+            contentAlignment = Alignment.Center
+        ) {
+            if (isSelected) {
+                Icon(
+                    imageVector = Icons.Default.Check,
+                    contentDescription = "محدد",
+                    tint = Color.Black,
+                    modifier = Modifier.size(if (compact) 13.dp else 15.dp)
+                )
+            }
+        }
+    }
+}
